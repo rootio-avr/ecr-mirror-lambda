@@ -79,7 +79,7 @@ func NewHandler(ctx context.Context) (*Handler, error) {
 
 	rootKeychain := &staticKeychain{
 		registry: cfg.RegistryHost,
-		auth:     &authn.Basic{Username: "_token", Password: rootAPIKey},
+		auth:     &authn.Basic{Username: "root", Password: rootAPIKey},
 	}
 
 	dstRepoName := cfg.DstRepoURL
@@ -134,15 +134,12 @@ func (h *Handler) Handle(ctx context.Context, req events.LambdaFunctionURLReques
 		return respond(http.StatusOK, "event type ignored")
 	}
 
-	if ce.Data.ImageRepo == "" || ce.Data.ImageTag == "" {
-		log.Warn("missing image_repo or image_tag in event data")
-		return respond(http.StatusBadRequest, "missing image_repo or image_tag")
+	if ce.Subject == "" || ce.Data.ImageRepo == "" || ce.Data.ImageTag == "" {
+		log.Warn("missing required fields in event data")
+		return respond(http.StatusBadRequest, "missing subject, image_repo, or image_tag")
 	}
 
 	src := ce.Subject
-	if src == "" {
-		src = fmt.Sprintf("%s/%s:%s", h.cfg.RegistryHost, ce.Data.ImageRepo, ce.Data.ImageTag)
-	}
 
 	ecrRepoName := fmt.Sprintf("%s/%s", h.dstRepoName, ce.Data.ImageRepo)
 	if err := h.ensureECRRepo(ctx, ecrRepoName); err != nil {
