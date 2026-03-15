@@ -30,7 +30,8 @@ No long-lived credentials — the Lambda uses its IAM role for ECR and reads sec
 ## Prerequisites
 
 - **AWS CLI** — configured with an active profile ([install guide](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html))
-- **Terraform** >= 1.5 ([install guide](https://developer.hashicorp.com/terraform/install))
+- **Terraform** >= 1.5 / **OpenTofu** >= 1.5 ([Terraform install](https://developer.hashicorp.com/terraform/install) | [OpenTofu install](https://opentofu.org/docs/intro/install/))
+- **AWS provider** `hashicorp/aws` ~> 5.0
 - **Docker** ([install guide](https://docs.docker.com/get-docker/))
 - **A Root account** with an API key
 

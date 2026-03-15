@@ -50,14 +50,10 @@ data "aws_iam_policy_document" "lambda_permissions" {
   }
 }
 
-data "aws_iam_policy" "lambda_basic" {
-  name = "AWSLambdaBasicExecutionRole"
-}
-
 resource "aws_iam_role" "lambda" {
   name                = "root-ecr-mirror"
   assume_role_policy  = data.aws_iam_policy_document.lambda_assume.json
-  managed_policy_arns = [data.aws_iam_policy.lambda_basic.arn]
+  managed_policy_arns = ["arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"]
 }
 
 resource "aws_iam_role_policy" "lambda" {
