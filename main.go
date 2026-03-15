@@ -5,7 +5,6 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -17,12 +16,13 @@ import (
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
-	"github.com/aws/aws-sdk-go-v2/config"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ecr"
 	ecrtypes "github.com/aws/aws-sdk-go-v2/service/ecr/types"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 	ecrcreds "github.com/awslabs/amazon-ecr-credential-helper/ecr-login"
 	"github.com/caarlos0/env/v11"
+	cloudevents "github.com/cloudevents/sdk-go/v2/event"
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/crane"
 )
@@ -58,7 +58,7 @@ func NewHandler(ctx context.Context) (*Handler, error) {
 		return nil, fmt.Errorf("parsing config: %w", err)
 	}
 
-	awsCfg, err := config.LoadDefaultConfig(ctx)
+	awsCfg, err := awsconfig.LoadDefaultConfig(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("loading AWS config: %w", err)
 	}
@@ -114,40 +114,46 @@ func (h *Handler) Handle(ctx context.Context, req events.LambdaFunctionURLReques
 		return respond(http.StatusUnauthorized, "signature verification failed")
 	}
 
-	var ce CloudEvent
-	if err := json.Unmarshal([]byte(req.Body), &ce); err != nil {
+	var ce cloudevents.Event
+	if err := ce.UnmarshalJSON([]byte(req.Body)); err != nil {
 		slog.Error("failed to parse CloudEvents payload", "error", err)
 		return respond(http.StatusBadRequest, "invalid payload")
 	}
 
-	log := slog.With("webhook_id", req.Headers[headerWebhookID], "event_id", ce.ID)
+	var data ImageEventData
+	if err := ce.DataAs(&data); err != nil {
+		slog.Error("failed to parse event data", "error", err)
+		return respond(http.StatusBadRequest, "invalid event data")
+	}
+
+	log := slog.With("webhook_id", req.Headers[headerWebhookID], "event_id", ce.ID())
 
 	log.Info("received event",
-		"type", ce.Type,
-		"subject", ce.Subject,
-		"image_repo", ce.Data.ImageRepo,
-		"image_tag", ce.Data.ImageTag,
+		"type", ce.Type(),
+		"subject", ce.Subject(),
+		"image_repo", data.ImageRepo,
+		"image_tag", data.ImageTag,
 	)
 
-	if ce.Type != imageCreatedEvent {
-		log.Info("skipping unhandled event type", "type", ce.Type)
+	if ce.Type() != imageCreatedEvent {
+		log.Info("skipping unhandled event type", "type", ce.Type())
 		return respond(http.StatusOK, "event type ignored")
 	}
 
-	if ce.Subject == "" || ce.Data.ImageRepo == "" || ce.Data.ImageTag == "" {
+	if ce.Subject() == "" || data.ImageRepo == "" || data.ImageTag == "" {
 		log.Warn("missing required fields in event data")
 		return respond(http.StatusBadRequest, "missing subject, image_repo, or image_tag")
 	}
 
-	src := ce.Subject
+	src := ce.Subject()
 
-	ecrRepoName := fmt.Sprintf("%s/%s", h.dstRepoName, ce.Data.ImageRepo)
+	ecrRepoName := fmt.Sprintf("%s/%s", h.dstRepoName, data.ImageRepo)
 	if err := h.ensureECRRepo(ctx, ecrRepoName); err != nil {
 		log.Error("failed to ensure ECR repo", "error", err, "repo", ecrRepoName)
 		return respond(http.StatusInternalServerError, "internal error")
 	}
 
-	dst := fmt.Sprintf("%s/%s:%s", h.cfg.DstRepoURL, ce.Data.ImageRepo, ce.Data.ImageTag)
+	dst := fmt.Sprintf("%s/%s:%s", h.cfg.DstRepoURL, data.ImageRepo, data.ImageTag)
 
 	log.Info("copying image", "src", src, "dst", dst)
 	if err := crane.Copy(src, dst, crane.WithAuthFromKeychain(h.keychain), crane.WithContext(ctx)); err != nil {
@@ -232,20 +238,8 @@ func (k *staticKeychain) Resolve(res authn.Resource) (authn.Authenticator, error
 	return k.auth, nil
 }
 
-// --- CloudEvents types ---
-
-type CloudEvent struct {
-	SpecVersion     string         `json:"specversion"`
-	Type            string         `json:"type"`
-	Source          string         `json:"source"`
-	ID              string         `json:"id"`
-	Time            string         `json:"time"`
-	Subject         string         `json:"subject"`
-	DataContentType string         `json:"datacontenttype"`
-	Data            CloudEventData `json:"data"`
-}
-
-type CloudEventData struct {
+// ImageEventData is the custom data payload for Root image events.
+type ImageEventData struct {
 	ImageRepo   string `json:"image_repo"`
 	ImageTag    string `json:"image_tag"`
 	ImageDigest string `json:"image_digest"`

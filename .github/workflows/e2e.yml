@@ -1,0 +1,121 @@
+name: E2E Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  LAMBDA_REPO: root-ecr-mirror-lambda
+  DST_REPO: root-mirror-e2e
+  TEST_IMAGE: python:3.13
+
+jobs:
+  e2e:
+    name: Deploy → Test → Teardown
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr-login
+
+      - name: Build and push Lambda image
+        env:
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          aws ecr create-repository --repository-name $LAMBDA_REPO --region $AWS_REGION 2>/dev/null || true
+          docker buildx build --platform linux/amd64 --provenance=false --sbom=false --output type=docker -t $REGISTRY/$LAMBDA_REPO:${{ github.sha }} .
+          docker push $REGISTRY/$LAMBDA_REPO:${{ github.sha }}
+          echo "LAMBDA_IMAGE=$REGISTRY/$LAMBDA_REPO:${{ github.sha }}" >> $GITHUB_ENV
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform apply
+        working-directory: terraform
+        env:
+          TF_VAR_aws_region: ${{ env.AWS_REGION }}
+          TF_VAR_dst_repo: root-mirror-e2e
+          TF_VAR_lambda_image_uri: ${{ env.LAMBDA_IMAGE }}
+          TF_VAR_webhook_signing_secret: ${{ secrets.TEST_WEBHOOK_SECRET }}
+          TF_VAR_root_api_key: ${{ secrets.TEST_ROOT_API_KEY }}
+        run: |
+          terraform init
+          terraform apply -auto-approve
+          echo "WEBHOOK_URL=$(terraform output -raw webhook_url)" >> $GITHUB_ENV
+
+      - name: Wait for Lambda to be ready
+        run: |
+          aws lambda wait function-active-v2 --function-name root-ecr-mirror --region $AWS_REGION
+
+      - name: Send test webhook
+        env:
+          SECRET: ${{ secrets.TEST_WEBHOOK_SECRET }}
+        run: |
+          IMAGE_REPO="${TEST_IMAGE%%:*}"
+          IMAGE_TAG="${TEST_IMAGE##*:}"
+
+          BODY="{\"specversion\":\"1.0\",\"type\":\"io.root.cr.image.created.v1\",\"source\":\"https://cr.root.io\",\"id\":\"e2e_${{ github.run_id }}\",\"time\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"subject\":\"cr.root.io/${TEST_IMAGE}\",\"datacontenttype\":\"application/json\",\"data\":{\"image_repo\":\"${IMAGE_REPO}\",\"image_tag\":\"${IMAGE_TAG}\",\"image_digest\":\"sha256:e2etest\",\"arch\":\"amd64\"}}"
+
+          MSG_ID="whmsg_e2e_${{ github.run_id }}"
+          TIMESTAMP=$(date +%s)
+          SIGNED="${MSG_ID}.${TIMESTAMP}.${BODY}"
+          SIGNATURE="v1,$(echo -n "$SIGNED" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $2}')"
+
+          HTTP_CODE=$(curl -s -o /tmp/response.txt -w "%{http_code}" \
+            -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/cloudevents+json" \
+            -H "webhook-id: $MSG_ID" \
+            -H "webhook-timestamp: $TIMESTAMP" \
+            -H "webhook-signature: $SIGNATURE" \
+            -d "$BODY")
+
+          echo "HTTP status: $HTTP_CODE"
+          echo "Response: $(cat /tmp/response.txt)"
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::Webhook returned $HTTP_CODE"
+            exit 1
+          fi
+
+      - name: Verify image in ECR
+        run: |
+          IMAGE_REPO="${TEST_IMAGE%%:*}"
+          aws ecr list-images \
+            --repository-name "$DST_REPO/$IMAGE_REPO" \
+            --region $AWS_REGION
+
+      - name: Terraform destroy
+        if: always()
+        working-directory: terraform
+        env:
+          TF_VAR_aws_region: ${{ env.AWS_REGION }}
+          TF_VAR_dst_repo: root-mirror-e2e
+          TF_VAR_lambda_image_uri: ${{ env.LAMBDA_IMAGE }}
+          TF_VAR_webhook_signing_secret: ${{ secrets.TEST_WEBHOOK_SECRET }}
+          TF_VAR_root_api_key: ${{ secrets.TEST_ROOT_API_KEY }}
+        run: terraform destroy -auto-approve
+
+      - name: Cleanup ECR repos
+        if: always()
+        run: |
+          aws ecr delete-repository --repository-name $LAMBDA_REPO --force --region $AWS_REGION 2>/dev/null || true
+          # Delete sub-repos created by the Lambda, then the base repo
+          for repo in $(aws ecr describe-repositories --region $AWS_REGION --query "repositories[?starts_with(repositoryName, '$DST_REPO/')].repositoryName" --output text 2>/dev/null); do
+            aws ecr delete-repository --repository-name "$repo" --force --region $AWS_REGION 2>/dev/null || true
+          done
+          aws ecr delete-repository --repository-name "$DST_REPO" --force --region $AWS_REGION 2>/dev/null || true

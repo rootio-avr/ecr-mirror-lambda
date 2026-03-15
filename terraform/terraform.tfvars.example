@@ -1,0 +1,15 @@
+aws_region       = "us-east-1"
+dst_repo         = "root-mirror"
+lambda_image_uri = "<ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/root-ecr-mirror-lambda:latest"
+
+# Root registry hostname (default: cr.root.io)
+# root_registry_host = "cr.root.io"
+
+# CloudWatch log retention in days (default: 14)
+# log_retention_days = 14
+
+# The signing secret provided by Root when creating the webhook subscription
+webhook_signing_secret = "whsec_..."
+
+# Your Root API key for pulling images from cr.root.io
+root_api_key = "root_..."
