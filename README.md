@@ -6,11 +6,19 @@ When Root patches a vulnerability and pushes a new image tag, this Lambda receiv
 
 ## How It Works
 
-```
-┌──────────┐    webhook     ┌──────────────────┐   crane.Copy   ┌──────────┐
-│  Root.io  │ ────────────→ │  AWS Lambda       │ ─────────────→ │ Your ECR │
-│ (cr.root) │  CloudEvents  │  (verify + copy)  │   IAM auth     │          │
-└──────────┘               └──────────────────┘               └──────────┘
+```mermaid
+sequenceDiagram
+    participant Root as Root.io (cr.root.io)
+    participant Lambda as AWS Lambda
+    participant SM as Secrets Manager
+    participant ECR as Your ECR
+
+    Root->>Lambda: Signed CloudEvents webhook
+    Lambda->>Lambda: Verify HMAC-SHA256 signature
+    Lambda->>SM: Fetch Root API key
+    Lambda->>Root: Pull image (crane)
+    Lambda->>ECR: Push image (crane)
+    Lambda-->>Root: 200 OK
 ```
 
 1. Root finishes remediating an image and sends a signed [CloudEvents](https://cloudevents.io/) webhook
@@ -20,8 +28,6 @@ When Root patches a vulnerability and pushes a new image tag, this Lambda receiv
 No long-lived credentials — the Lambda uses its IAM role for ECR and reads secrets from AWS Secrets Manager.
 
 ## Prerequisites
-
-You'll need:
 
 - **AWS CLI** — configured with an active profile ([install guide](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html))
 - **Terraform** >= 1.5 ([install guide](https://developer.hashicorp.com/terraform/install))
@@ -54,11 +60,14 @@ aws ecr get-login-password --region $AWS_REGION | \
 # Create a repo for the Lambda image (one-time)
 aws ecr create-repository --repository-name root-ecr-mirror-lambda --region $AWS_REGION
 
-# Build and push
-docker build --platform linux/amd64 \
+# Build and push (--provenance=false is required for Lambda compatibility)
+docker buildx build --platform linux/amd64 --provenance=false --sbom=false \
+  --output type=docker \
   -t $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/root-ecr-mirror-lambda:latest .
 docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/root-ecr-mirror-lambda:latest
 ```
+
+> **Note:** Lambda only supports Docker v2 manifests. The `--provenance=false --sbom=false` flags prevent Docker BuildKit from producing OCI manifests that Lambda rejects.
 
 ### Step 3: Configure and deploy
 
@@ -89,7 +98,7 @@ terraform apply
 When it finishes, you'll see two outputs:
 
 ```
-webhook_url       = "https://xxxxx.lambda-url.us-east-1.on.aws/"
+webhook_url        = "https://xxxxx.lambda-url.us-east-1.on.aws/"
 ecr_repository_url = "123456789012.dkr.ecr.us-east-1.amazonaws.com/root-mirror"
 ```
 
@@ -168,22 +177,24 @@ This cleanly deletes the Lambda, IAM role, secrets, ECR repository, CloudWatch l
 
 ## What Gets Deployed
 
-```
-┌─ AWS Account ────────────────────────────────────────────────┐
-│                                                              │
-│  Lambda Function        root-ecr-mirror                      │
-│  ├─ Function URL        https://xxxxx.lambda-url...on.aws/   │
-│  ├─ IAM Role            ECR push + Secrets Manager read      │
-│  └─ CloudWatch Logs     /aws/lambda/root-ecr-mirror          │
-│                                                              │
-│  Secrets Manager                                             │
-│  ├─ root-ecr-mirror/webhook-signing-secret                   │
-│  └─ root-ecr-mirror/root-api-key                             │
-│                                                              │
-│  ECR Repository         root-mirror/                         │
-│  └─ (sub-repos created automatically per image)              │
-│                                                              │
-└──────────────────────────────────────────────────────────────┘
+```mermaid
+graph TD
+    subgraph AWS Account
+        LF[Lambda Function<br><b>root-ecr-mirror</b>]
+        URL[Function URL<br>https://xxxxx.lambda-url...on.aws/]
+        IAM[IAM Role<br>ECR push + Secrets Manager read]
+        CW[CloudWatch Logs<br>/aws/lambda/root-ecr-mirror]
+        SM1[Secret<br>root-ecr-mirror/webhook-signing-secret]
+        SM2[Secret<br>root-ecr-mirror/root-api-key]
+        ECR[ECR Repository<br><b>root-mirror/</b><br>sub-repos created per image]
+    end
+
+    URL --> LF
+    LF --> IAM
+    LF --> CW
+    LF --> SM1
+    LF --> SM2
+    LF --> ECR
 ```
 
 ## Security
@@ -197,18 +208,25 @@ This cleanly deletes the Lambda, IAM role, secrets, ECR repository, CloudWatch l
 | **Timing-safe comparison** | HMAC verified with `hmac.Equal` to prevent timing attacks |
 | **Event filtering** | Only `io.root.cr.image.created.v1` events are processed |
 
-## Development
+## Troubleshooting
 
-Run the tests:
+**Lambda Function URL returns 403 Forbidden:**
+If your AWS account is part of an AWS Organization, a Service Control Policy (SCP) may block public Lambda Function URLs. Check with your infrastructure team, or consider placing API Gateway in front of the Lambda.
+
+**Docker build produces OCI manifests:**
+Lambda only supports Docker v2 manifests. Always build with `--provenance=false --sbom=false`. Verify the manifest type after pushing:
 
 ```sh
-go test -v ./...
+aws ecr describe-images --repository-name root-ecr-mirror-lambda \
+  --query 'imageDetails[].imageManifestMediaType'
+# Expected: ["application/vnd.docker.distribution.manifest.v2+json"]
 ```
 
-Build locally:
+**`image copy failed` in logs:**
+Check that the image actually exists on `cr.root.io` and that your Root API key has pull access. You can verify with:
 
 ```sh
-go build -o ecr-mirror-lambda .
+aws logs tail /aws/lambda/root-ecr-mirror --since 5m
 ```
 
 ## License

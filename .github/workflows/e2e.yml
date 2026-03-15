@@ -13,7 +13,7 @@ env:
   AWS_REGION: us-east-1
   LAMBDA_REPO: root-ecr-mirror-lambda
   DST_REPO: root-mirror-e2e
-  TEST_IMAGE: library/python:3.12-root
+  TEST_IMAGE: python:3.13
 
 jobs:
   e2e:
@@ -35,7 +35,7 @@ jobs:
           REGISTRY: ${{ steps.ecr-login.outputs.registry }}
         run: |
           aws ecr create-repository --repository-name $LAMBDA_REPO --region $AWS_REGION 2>/dev/null || true
-          docker build --platform linux/amd64 -t $REGISTRY/$LAMBDA_REPO:${{ github.sha }} .
+          docker buildx build --platform linux/amd64 --provenance=false --sbom=false --output type=docker -t $REGISTRY/$LAMBDA_REPO:${{ github.sha }} .
           docker push $REGISTRY/$LAMBDA_REPO:${{ github.sha }}
           echo "LAMBDA_IMAGE=$REGISTRY/$LAMBDA_REPO:${{ github.sha }}" >> $GITHUB_ENV
 
@@ -56,6 +56,10 @@ jobs:
           terraform apply -auto-approve
           echo "WEBHOOK_URL=$(terraform output -raw webhook_url)" >> $GITHUB_ENV
 
+      - name: Wait for Lambda to be ready
+        run: |
+          aws lambda wait function-active-v2 --function-name root-ecr-mirror --region $AWS_REGION
+
       - name: Send test webhook
         env:
           SECRET: ${{ secrets.TEST_WEBHOOK_SECRET }}
@@ -63,11 +67,7 @@ jobs:
           IMAGE_REPO="${TEST_IMAGE%%:*}"
           IMAGE_TAG="${TEST_IMAGE##*:}"
 
-          BODY=$(cat <<EOF
-          {"specversion":"1.0","type":"io.root.cr.image.created.v1","source":"https://cr.root.io","id":"e2e_${{ github.run_id }}","time":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","subject":"cr.root.io/${TEST_IMAGE}","datacontenttype":"application/json","data":{"image_repo":"${IMAGE_REPO}","image_tag":"${IMAGE_TAG}","image_digest":"sha256:e2etest","arch":"amd64"}}
-          EOF
-          )
-          BODY=$(echo "$BODY" | tr -d '\n ')
+          BODY="{\"specversion\":\"1.0\",\"type\":\"io.root.cr.image.created.v1\",\"source\":\"https://cr.root.io\",\"id\":\"e2e_${{ github.run_id }}\",\"time\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"subject\":\"cr.root.io/${TEST_IMAGE}\",\"datacontenttype\":\"application/json\",\"data\":{\"image_repo\":\"${IMAGE_REPO}\",\"image_tag\":\"${IMAGE_TAG}\",\"image_digest\":\"sha256:e2etest\",\"arch\":\"amd64\"}}"
 
           MSG_ID="whmsg_e2e_${{ github.run_id }}"
           TIMESTAMP=$(date +%s)
@@ -93,10 +93,6 @@ jobs:
       - name: Verify image in ECR
         run: |
           IMAGE_REPO="${TEST_IMAGE%%:*}"
-
-          echo "Waiting 10s for image to appear..."
-          sleep 10
-
           aws ecr list-images \
             --repository-name "$DST_REPO/$IMAGE_REPO" \
             --region $AWS_REGION
@@ -112,8 +108,12 @@ jobs:
           TF_VAR_root_api_key: ${{ secrets.TEST_ROOT_API_KEY }}
         run: terraform destroy -auto-approve
 
-      - name: Cleanup Lambda ECR repo
+      - name: Cleanup ECR repos
         if: always()
         run: |
           aws ecr delete-repository --repository-name $LAMBDA_REPO --force --region $AWS_REGION 2>/dev/null || true
+          # Delete sub-repos created by the Lambda, then the base repo
+          for repo in $(aws ecr describe-repositories --region $AWS_REGION --query "repositories[?starts_with(repositoryName, '$DST_REPO/')].repositoryName" --output text 2>/dev/null); do
+            aws ecr delete-repository --repository-name "$repo" --force --region $AWS_REGION 2>/dev/null || true
+          done
           aws ecr delete-repository --repository-name "$DST_REPO" --force --region $AWS_REGION 2>/dev/null || true

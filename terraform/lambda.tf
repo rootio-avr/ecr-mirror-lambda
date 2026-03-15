@@ -55,15 +55,15 @@ data "aws_iam_policy" "lambda_basic" {
 }
 
 resource "aws_iam_role" "lambda" {
-  name               = "root-ecr-mirror"
-  assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
-
-  inline_policy {
-    name   = "ecr-push-and-secrets"
-    policy = data.aws_iam_policy_document.lambda_permissions.json
-  }
-
+  name                = "root-ecr-mirror"
+  assume_role_policy  = data.aws_iam_policy_document.lambda_assume.json
   managed_policy_arns = [data.aws_iam_policy.lambda_basic.arn]
+}
+
+resource "aws_iam_role_policy" "lambda" {
+  name   = "ecr-push-and-secrets"
+  role   = aws_iam_role.lambda.id
+  policy = data.aws_iam_policy_document.lambda_permissions.json
 }
 
 resource "aws_cloudwatch_log_group" "lambda" {
@@ -76,8 +76,8 @@ resource "aws_lambda_function" "mirror" {
   role          = aws_iam_role.lambda.arn
   package_type  = "Image"
   image_uri     = var.lambda_image_uri
-  timeout       = 300
-  memory_size   = 256
+  timeout       = 600
+  memory_size   = 1024
 
   environment {
     variables = {
@@ -88,10 +88,28 @@ resource "aws_lambda_function" "mirror" {
     }
   }
 
-  depends_on = [aws_cloudwatch_log_group.lambda]
+  depends_on = [
+    aws_cloudwatch_log_group.lambda,
+    aws_iam_role_policy.lambda,
+  ]
 }
 
 resource "aws_lambda_function_url" "mirror" {
   function_name      = aws_lambda_function.mirror.function_name
   authorization_type = "NONE"
+}
+
+resource "aws_lambda_permission" "public_url_invoke" {
+  statement_id           = "AllowPublicURLInvoke"
+  action                 = "lambda:InvokeFunctionUrl"
+  function_name          = aws_lambda_function.mirror.function_name
+  principal              = "*"
+  function_url_auth_type = "NONE"
+}
+
+resource "aws_lambda_permission" "public_function_invoke" {
+  statement_id  = "AllowPublicFunctionInvoke"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.mirror.function_name
+  principal     = "*"
 }
