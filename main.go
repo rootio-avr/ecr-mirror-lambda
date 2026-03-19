@@ -36,6 +36,8 @@ const (
 	headerWebhookID        = "webhook-id"
 	headerWebhookTimestamp = "webhook-timestamp"
 	headerWebhookSignature = "webhook-signature"
+
+	osLinux = "linux"
 )
 
 type Config struct {
@@ -172,7 +174,7 @@ func buildCopyOptions(keychain authn.Keychain, ctx context.Context, arch string)
 		crane.WithContext(ctx),
 	}
 	if arch != "" {
-		opts = append(opts, crane.WithPlatform(&v1.Platform{OS: "linux", Architecture: arch}))
+		opts = append(opts, crane.WithPlatform(&v1.Platform{OS: osLinux, Architecture: arch}))
 	}
 	return opts
 }
