@@ -25,6 +25,7 @@ import (
 	cloudevents "github.com/cloudevents/sdk-go/v2/event"
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/crane"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 )
 
 const (
@@ -35,6 +36,8 @@ const (
 	headerWebhookID        = "webhook-id"
 	headerWebhookTimestamp = "webhook-timestamp"
 	headerWebhookSignature = "webhook-signature"
+
+	osLinux = "linux"
 )
 
 type Config struct {
@@ -156,13 +159,24 @@ func (h *Handler) Handle(ctx context.Context, req events.LambdaFunctionURLReques
 	dst := fmt.Sprintf("%s/%s:%s", h.cfg.DstRepoURL, data.ImageRepo, data.ImageTag)
 
 	log.Info("copying image", "src", src, "dst", dst)
-	if err := crane.Copy(src, dst, crane.WithAuthFromKeychain(h.keychain), crane.WithContext(ctx)); err != nil {
+	if err := crane.Copy(src, dst, buildCopyOptions(h.keychain, ctx, data.Arch)...); err != nil {
 		log.Error("failed to copy image", "error", err, "src", src, "dst", dst)
 		return respond(http.StatusInternalServerError, "image copy failed")
 	}
 
 	log.Info("image copied successfully", "src", src, "dst", dst)
 	return respond(http.StatusOK, "ok")
+}
+
+func buildCopyOptions(keychain authn.Keychain, ctx context.Context, arch string) []crane.Option {
+	opts := []crane.Option{
+		crane.WithAuthFromKeychain(keychain),
+		crane.WithContext(ctx),
+	}
+	if arch != "" {
+		opts = append(opts, crane.WithPlatform(&v1.Platform{OS: osLinux, Architecture: arch}))
+	}
+	return opts
 }
 
 // --- Standard Webhooks signature verification ---
