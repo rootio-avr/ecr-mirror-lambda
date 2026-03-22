@@ -77,10 +77,11 @@ resource "aws_lambda_function" "mirror" {
 
   environment {
     variables = {
-      WEBHOOK_SECRET_ARN = aws_secretsmanager_secret.webhook_secret.arn
-      ROOT_API_KEY_ARN   = aws_secretsmanager_secret.root_api_key.arn
-      DST_REPO_URL       = aws_ecr_repository.root_mirror.repository_url
-      ROOT_REGISTRY_HOST = var.root_registry_host
+      WEBHOOK_SECRET_ARN        = aws_secretsmanager_secret.webhook_secret.arn
+      ROOT_API_KEY_ARN          = aws_secretsmanager_secret.root_api_key.arn
+      DST_REPO_URL              = aws_ecr_repository.root_mirror.repository_url
+      ROOT_REGISTRY_HOST        = var.root_registry_host
+      WEBHOOK_SECRET_CONFIGURED = var.webhook_signing_secret != "" ? "true" : "false"
     }
   }
 

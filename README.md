@@ -70,33 +70,32 @@ docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/root-ecr-mirror-la
 
 > **Note:** Lambda only supports Docker v2 manifests. The `--provenance=false --sbom=false` flags prevent Docker BuildKit from producing OCI manifests that Lambda rejects.
 
-### Step 3: Configure and deploy
+### Step 3: First deploy — get the webhook URL
 
 ```sh
 cd terraform/
 cp terraform.tfvars.example terraform.tfvars
 ```
 
-Open `terraform.tfvars` and fill in your values:
+Open `terraform.tfvars` and fill in your values. Leave `webhook_signing_secret` empty for now — you'll get it in Step 4:
 
 ```hcl
 aws_region       = "us-east-1"
 dst_repo         = "root-mirror"
 lambda_image_uri = "123456789012.dkr.ecr.us-east-1.amazonaws.com/root-ecr-mirror-lambda:latest"
 
-# You'll get these from Root (see Step 4)
-webhook_signing_secret = ""
+webhook_signing_secret = ""   # fill in after Step 4
 root_api_key           = "root_..."
 ```
 
-Then deploy:
+Deploy:
 
 ```sh
 terraform init
 terraform apply
 ```
 
-When it finishes, you'll see two outputs:
+When it finishes, note the `webhook_url` output:
 
 ```
 webhook_url        = "https://xxxxx.lambda-url.us-east-1.on.aws/"
@@ -105,7 +104,7 @@ ecr_repository_url = "123456789012.dkr.ecr.us-east-1.amazonaws.com/root-mirror"
 
 ### Step 4: Register the webhook in Root
 
-Copy the `webhook_url` from the Terraform output and create a webhook subscription:
+Copy the `webhook_url` and create a webhook subscription in Root:
 
 ```sh
 curl -X POST https://api.root.io/v3/settings/webhooks \
@@ -118,7 +117,21 @@ curl -X POST https://api.root.io/v3/settings/webhooks \
   }'
 ```
 
-The response includes a `secret` field — copy it, paste it into `terraform.tfvars` as `webhook_signing_secret`, and run `terraform apply` once more.
+The response includes a `secret` field.
+
+### Step 5: Second deploy — set the signing secret
+
+Paste the secret into `terraform.tfvars`:
+
+```hcl
+webhook_signing_secret = "whsec_..."
+```
+
+Then apply again:
+
+```sh
+terraform apply
+```
 
 That's it. Every new Root remediated image will now automatically appear in your ECR.
 
@@ -165,7 +178,7 @@ This cleanly deletes the Lambda, IAM role, secrets, ECR repository, CloudWatch l
 | `dst_repo` | No | `root-mirror` | Base ECR repository name. Images appear as `<dst_repo>/<image_name>:<tag>` |
 | `lambda_image_uri` | **Yes** | — | ECR URI of the built Lambda container image |
 | `root_registry_host` | No | `cr.root.io` | Root registry hostname |
-| `webhook_signing_secret` | **Yes** | — | HMAC signing secret from your Root webhook subscription |
+| `webhook_signing_secret` | No | `""` | HMAC signing secret from your Root webhook subscription. Empty on first apply; set after Step 4 |
 | `root_api_key` | **Yes** | — | Root API key for pulling images from the Root registry |
 | `log_retention_days` | No | `14` | CloudWatch log retention in days |
 
