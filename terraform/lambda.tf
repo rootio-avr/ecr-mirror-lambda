@@ -51,9 +51,13 @@ data "aws_iam_policy_document" "lambda_permissions" {
 }
 
 resource "aws_iam_role" "lambda" {
-  name                = "root-ecr-mirror"
-  assume_role_policy  = data.aws_iam_policy_document.lambda_assume.json
-  managed_policy_arns = ["arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"]
+  name               = "root-ecr-mirror"
+  assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
+}
+
+resource "aws_iam_role_policy_attachment" "lambda_basic_execution" {
+  role       = aws_iam_role.lambda.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
 resource "aws_iam_role_policy" "lambda" {
