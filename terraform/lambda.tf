@@ -51,9 +51,13 @@ data "aws_iam_policy_document" "lambda_permissions" {
 }
 
 resource "aws_iam_role" "lambda" {
-  name                = "root-ecr-mirror"
-  assume_role_policy  = data.aws_iam_policy_document.lambda_assume.json
-  managed_policy_arns = ["arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"]
+  name               = "root-ecr-mirror"
+  assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
+}
+
+resource "aws_iam_role_policy_attachment" "lambda_basic_execution" {
+  role       = aws_iam_role.lambda.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
 resource "aws_iam_role_policy" "lambda" {
@@ -77,10 +81,11 @@ resource "aws_lambda_function" "mirror" {
 
   environment {
     variables = {
-      WEBHOOK_SECRET_ARN = aws_secretsmanager_secret.webhook_secret.arn
-      ROOT_API_KEY_ARN   = aws_secretsmanager_secret.root_api_key.arn
-      DST_REPO_URL       = aws_ecr_repository.root_mirror.repository_url
-      ROOT_REGISTRY_HOST = var.root_registry_host
+      WEBHOOK_SECRET_ARN        = aws_secretsmanager_secret.webhook_secret.arn
+      ROOT_API_KEY_ARN          = aws_secretsmanager_secret.root_api_key.arn
+      DST_REPO_URL              = aws_ecr_repository.root_mirror.repository_url
+      ROOT_REGISTRY_HOST        = var.root_registry_host
+      WEBHOOK_SECRET_CONFIGURED = var.webhook_signing_secret != "" ? "true" : "false"
     }
   }
 

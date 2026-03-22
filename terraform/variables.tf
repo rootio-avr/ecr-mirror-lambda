@@ -24,7 +24,8 @@ variable "root_registry_host" {
 variable "webhook_signing_secret" {
   type        = string
   sensitive   = true
-  description = "The signing secret provided by Root when creating the webhook subscription."
+  description = "The signing secret provided by Root when creating the webhook subscription. Leave empty on the first apply; fill in after registering the webhook URL with Root."
+  default     = ""
 }
 
 variable "root_api_key" {

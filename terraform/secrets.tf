@@ -5,6 +5,7 @@ resource "aws_secretsmanager_secret" "webhook_secret" {
 }
 
 resource "aws_secretsmanager_secret_version" "webhook_secret" {
+  count         = var.webhook_signing_secret != "" ? 1 : 0
   secret_id     = aws_secretsmanager_secret.webhook_secret.id
   secret_string = var.webhook_signing_secret
 }
