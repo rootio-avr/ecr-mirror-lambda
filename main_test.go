@@ -19,80 +19,38 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/random"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/types"
+	"github.com/stretchr/testify/mock"
 )
 
-// --- fakeECR test double ---
+// --- mockECRAPI ---
 
-type setPolicyCall struct {
-	repo   string
-	policy string
+type mockECRAPI struct {
+	mock.Mock
 }
 
-type setLifecycleCall struct {
-	repo   string
-	policy string
+func (m *mockECRAPI) CreateRepository(ctx context.Context, params *ecr.CreateRepositoryInput, _ ...func(*ecr.Options)) (*ecr.CreateRepositoryOutput, error) {
+	args := m.Called(ctx, params)
+	return args.Get(0).(*ecr.CreateRepositoryOutput), args.Error(1)
 }
 
-type fakeECR struct {
-	repos           map[string]bool
-	repoPolicy      map[string]string
-	lifecyclePolicy map[string]string
-
-	createdRepos      []string
-	setPolicyCalls    []setPolicyCall
-	setLifecycleCalls []setLifecycleCall
+func (m *mockECRAPI) GetRepositoryPolicy(ctx context.Context, params *ecr.GetRepositoryPolicyInput, _ ...func(*ecr.Options)) (*ecr.GetRepositoryPolicyOutput, error) {
+	args := m.Called(ctx, params)
+	return args.Get(0).(*ecr.GetRepositoryPolicyOutput), args.Error(1)
 }
 
-func newFakeECR() *fakeECR {
-	return &fakeECR{
-		repos:           make(map[string]bool),
-		repoPolicy:      make(map[string]string),
-		lifecyclePolicy: make(map[string]string),
-	}
+func (m *mockECRAPI) SetRepositoryPolicy(ctx context.Context, params *ecr.SetRepositoryPolicyInput, _ ...func(*ecr.Options)) (*ecr.SetRepositoryPolicyOutput, error) {
+	args := m.Called(ctx, params)
+	return args.Get(0).(*ecr.SetRepositoryPolicyOutput), args.Error(1)
 }
 
-func (f *fakeECR) CreateRepository(_ context.Context, params *ecr.CreateRepositoryInput, _ ...func(*ecr.Options)) (*ecr.CreateRepositoryOutput, error) {
-	n := *params.RepositoryName
-	if f.repos[n] {
-		return nil, &ecrtypes.RepositoryAlreadyExistsException{}
-	}
-	f.repos[n] = true
-	f.createdRepos = append(f.createdRepos, n)
-	return &ecr.CreateRepositoryOutput{}, nil
+func (m *mockECRAPI) GetLifecyclePolicy(ctx context.Context, params *ecr.GetLifecyclePolicyInput, _ ...func(*ecr.Options)) (*ecr.GetLifecyclePolicyOutput, error) {
+	args := m.Called(ctx, params)
+	return args.Get(0).(*ecr.GetLifecyclePolicyOutput), args.Error(1)
 }
 
-func (f *fakeECR) GetRepositoryPolicy(_ context.Context, params *ecr.GetRepositoryPolicyInput, _ ...func(*ecr.Options)) (*ecr.GetRepositoryPolicyOutput, error) {
-	n := *params.RepositoryName
-	policy, ok := f.repoPolicy[n]
-	if !ok {
-		return nil, &ecrtypes.RepositoryPolicyNotFoundException{}
-	}
-	return &ecr.GetRepositoryPolicyOutput{PolicyText: &policy}, nil
-}
-
-func (f *fakeECR) SetRepositoryPolicy(_ context.Context, params *ecr.SetRepositoryPolicyInput, _ ...func(*ecr.Options)) (*ecr.SetRepositoryPolicyOutput, error) {
-	f.setPolicyCalls = append(f.setPolicyCalls, setPolicyCall{
-		repo:   *params.RepositoryName,
-		policy: *params.PolicyText,
-	})
-	return &ecr.SetRepositoryPolicyOutput{}, nil
-}
-
-func (f *fakeECR) GetLifecyclePolicy(_ context.Context, params *ecr.GetLifecyclePolicyInput, _ ...func(*ecr.Options)) (*ecr.GetLifecyclePolicyOutput, error) {
-	n := *params.RepositoryName
-	policy, ok := f.lifecyclePolicy[n]
-	if !ok {
-		return nil, &ecrtypes.LifecyclePolicyNotFoundException{}
-	}
-	return &ecr.GetLifecyclePolicyOutput{LifecyclePolicyText: &policy}, nil
-}
-
-func (f *fakeECR) PutLifecyclePolicy(_ context.Context, params *ecr.PutLifecyclePolicyInput, _ ...func(*ecr.Options)) (*ecr.PutLifecyclePolicyOutput, error) {
-	f.setLifecycleCalls = append(f.setLifecycleCalls, setLifecycleCall{
-		repo:   *params.RepositoryName,
-		policy: *params.LifecyclePolicyText,
-	})
-	return &ecr.PutLifecyclePolicyOutput{}, nil
+func (m *mockECRAPI) PutLifecyclePolicy(ctx context.Context, params *ecr.PutLifecyclePolicyInput, _ ...func(*ecr.Options)) (*ecr.PutLifecyclePolicyOutput, error) {
+	args := m.Called(ctx, params)
+	return args.Get(0).(*ecr.PutLifecyclePolicyOutput), args.Error(1)
 }
 
 // --- allowlist tests ---
@@ -122,130 +80,97 @@ func TestIsRepoAllowed(t *testing.T) {
 
 // --- ensureECRRepo tests ---
 
+func ptr(s string) *string { return &s }
+
 func TestEnsureECRRepo(t *testing.T) {
 	ctx := context.Background()
 	const baseRepo = "root-mirror"
+	const newRepo = baseRepo + "/python"
+	const repoPolicy = `{"Version":"2012-10-17"}`
+	const lifecyclePolicy = `{"rules":[]}`
 
 	t.Run("copies repo policy and lifecycle policy from base for new repo", func(t *testing.T) {
-		fake := newFakeECR()
-		fake.repoPolicy[baseRepo] = `{"Version":"2012-10-17"}`
-		fake.lifecyclePolicy[baseRepo] = `{"rules":[]}`
+		m := &mockECRAPI{}
+		m.On("CreateRepository", ctx, mock.MatchedBy(func(p *ecr.CreateRepositoryInput) bool { return *p.RepositoryName == newRepo })).
+			Return(&ecr.CreateRepositoryOutput{}, nil)
+		m.On("GetRepositoryPolicy", ctx, mock.MatchedBy(func(p *ecr.GetRepositoryPolicyInput) bool { return *p.RepositoryName == baseRepo })).
+			Return(&ecr.GetRepositoryPolicyOutput{PolicyText: ptr(repoPolicy)}, nil)
+		m.On("SetRepositoryPolicy", ctx, mock.MatchedBy(func(p *ecr.SetRepositoryPolicyInput) bool {
+			return *p.RepositoryName == newRepo && *p.PolicyText == repoPolicy
+		})).Return(&ecr.SetRepositoryPolicyOutput{}, nil)
+		m.On("GetLifecyclePolicy", ctx, mock.MatchedBy(func(p *ecr.GetLifecyclePolicyInput) bool { return *p.RepositoryName == baseRepo })).
+			Return(&ecr.GetLifecyclePolicyOutput{LifecyclePolicyText: ptr(lifecyclePolicy)}, nil)
+		m.On("PutLifecyclePolicy", ctx, mock.MatchedBy(func(p *ecr.PutLifecyclePolicyInput) bool {
+			return *p.RepositoryName == newRepo && *p.LifecyclePolicyText == lifecyclePolicy
+		})).Return(&ecr.PutLifecyclePolicyOutput{}, nil)
 
-		h := &Handler{dstRepoName: baseRepo, ecrClient: fake}
-		if err := h.ensureECRRepo(ctx, baseRepo+"/python"); err != nil {
+		h := &Handler{dstRepoName: baseRepo, ecrClient: m}
+		if err := h.ensureECRRepo(ctx, newRepo); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-
-		if len(fake.setPolicyCalls) != 1 {
-			t.Fatalf("expected 1 SetRepositoryPolicy call, got %d", len(fake.setPolicyCalls))
-		}
-		if fake.setPolicyCalls[0].repo != baseRepo+"/python" {
-			t.Errorf("SetRepositoryPolicy on wrong repo: %s", fake.setPolicyCalls[0].repo)
-		}
-		if fake.setPolicyCalls[0].policy != `{"Version":"2012-10-17"}` {
-			t.Errorf("unexpected policy text: %s", fake.setPolicyCalls[0].policy)
-		}
-
-		if len(fake.setLifecycleCalls) != 1 {
-			t.Fatalf("expected 1 PutLifecyclePolicy call, got %d", len(fake.setLifecycleCalls))
-		}
-		if fake.setLifecycleCalls[0].repo != baseRepo+"/python" {
-			t.Errorf("PutLifecyclePolicy on wrong repo: %s", fake.setLifecycleCalls[0].repo)
-		}
-		if fake.setLifecycleCalls[0].policy != `{"rules":[]}` {
-			t.Errorf("unexpected lifecycle policy text: %s", fake.setLifecycleCalls[0].policy)
-		}
+		m.AssertExpectations(t)
 	})
 
 	t.Run("does not copy policies for already-existing repo", func(t *testing.T) {
-		fake := newFakeECR()
-		fake.repos[baseRepo+"/python"] = true
-		fake.repoPolicy[baseRepo] = `{"Version":"2012-10-17"}`
-		fake.lifecyclePolicy[baseRepo] = `{"rules":[]}`
+		m := &mockECRAPI{}
+		m.On("CreateRepository", ctx, mock.Anything).
+			Return(&ecr.CreateRepositoryOutput{}, &ecrtypes.RepositoryAlreadyExistsException{})
 
-		h := &Handler{dstRepoName: baseRepo, ecrClient: fake}
-		if err := h.ensureECRRepo(ctx, baseRepo+"/python"); err != nil {
+		h := &Handler{dstRepoName: baseRepo, ecrClient: m}
+		if err := h.ensureECRRepo(ctx, newRepo); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-
-		if len(fake.setPolicyCalls) != 0 {
-			t.Errorf("expected no SetRepositoryPolicy calls for existing repo, got %v", fake.setPolicyCalls)
-		}
-		if len(fake.setLifecycleCalls) != 0 {
-			t.Errorf("expected no PutLifecyclePolicy calls for existing repo, got %v", fake.setLifecycleCalls)
-		}
+		m.AssertExpectations(t)
+		m.AssertNotCalled(t, "GetRepositoryPolicy")
+		m.AssertNotCalled(t, "GetLifecyclePolicy")
 	})
 
 	t.Run("skips repo policy copy if base has no repo policy", func(t *testing.T) {
-		fake := newFakeECR()
-		fake.lifecyclePolicy[baseRepo] = `{"rules":[]}`
+		m := &mockECRAPI{}
+		m.On("CreateRepository", ctx, mock.Anything).Return(&ecr.CreateRepositoryOutput{}, nil)
+		m.On("GetRepositoryPolicy", ctx, mock.Anything).
+			Return(&ecr.GetRepositoryPolicyOutput{}, &ecrtypes.RepositoryPolicyNotFoundException{})
+		m.On("GetLifecyclePolicy", ctx, mock.Anything).
+			Return(&ecr.GetLifecyclePolicyOutput{LifecyclePolicyText: ptr(lifecyclePolicy)}, nil)
+		m.On("PutLifecyclePolicy", ctx, mock.Anything).Return(&ecr.PutLifecyclePolicyOutput{}, nil)
 
-		h := &Handler{dstRepoName: baseRepo, ecrClient: fake}
-		if err := h.ensureECRRepo(ctx, baseRepo+"/python"); err != nil {
+		h := &Handler{dstRepoName: baseRepo, ecrClient: m}
+		if err := h.ensureECRRepo(ctx, newRepo); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-
-		if len(fake.setPolicyCalls) != 0 {
-			t.Errorf("expected no SetRepositoryPolicy calls, got %v", fake.setPolicyCalls)
-		}
-		if len(fake.setLifecycleCalls) != 1 {
-			t.Errorf("expected PutLifecyclePolicy to be called, got %d calls", len(fake.setLifecycleCalls))
-		}
+		m.AssertExpectations(t)
+		m.AssertNotCalled(t, "SetRepositoryPolicy")
 	})
 
 	t.Run("skips lifecycle policy copy if base has no lifecycle policy", func(t *testing.T) {
-		fake := newFakeECR()
-		fake.repoPolicy[baseRepo] = `{"Version":"2012-10-17"}`
+		m := &mockECRAPI{}
+		m.On("CreateRepository", ctx, mock.Anything).Return(&ecr.CreateRepositoryOutput{}, nil)
+		m.On("GetRepositoryPolicy", ctx, mock.Anything).
+			Return(&ecr.GetRepositoryPolicyOutput{PolicyText: ptr(repoPolicy)}, nil)
+		m.On("SetRepositoryPolicy", ctx, mock.Anything).Return(&ecr.SetRepositoryPolicyOutput{}, nil)
+		m.On("GetLifecyclePolicy", ctx, mock.Anything).
+			Return(&ecr.GetLifecyclePolicyOutput{}, &ecrtypes.LifecyclePolicyNotFoundException{})
 
-		h := &Handler{dstRepoName: baseRepo, ecrClient: fake}
-		if err := h.ensureECRRepo(ctx, baseRepo+"/python"); err != nil {
+		h := &Handler{dstRepoName: baseRepo, ecrClient: m}
+		if err := h.ensureECRRepo(ctx, newRepo); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-
-		if len(fake.setPolicyCalls) != 1 {
-			t.Errorf("expected SetRepositoryPolicy to be called, got %d calls", len(fake.setPolicyCalls))
-		}
-		if len(fake.setLifecycleCalls) != 0 {
-			t.Errorf("expected no PutLifecyclePolicy calls, got %v", fake.setLifecycleCalls)
-		}
+		m.AssertExpectations(t)
+		m.AssertNotCalled(t, "PutLifecyclePolicy")
 	})
 
 	t.Run("returns error on unexpected GetRepositoryPolicy failure", func(t *testing.T) {
-		fake := newFakeECR()
-		fake.repoPolicy["__error__"] = "" // sentinel unused; we'll override below
+		m := &mockECRAPI{}
+		m.On("CreateRepository", ctx, mock.Anything).Return(&ecr.CreateRepositoryOutput{}, nil)
+		m.On("GetRepositoryPolicy", ctx, mock.Anything).
+			Return(&ecr.GetRepositoryPolicyOutput{}, errors.New("unexpected AWS error"))
 
-		// Use a custom fake that returns an unexpected error
-		h := &Handler{dstRepoName: baseRepo, ecrClient: &erroringECR{inner: fake}}
-		err := h.ensureECRRepo(ctx, baseRepo+"/python")
-		if err == nil {
+		h := &Handler{dstRepoName: baseRepo, ecrClient: m}
+		if err := h.ensureECRRepo(ctx, newRepo); err == nil {
 			t.Fatal("expected error but got nil")
 		}
+		m.AssertExpectations(t)
 	})
-}
-
-// erroringECR wraps fakeECR but returns an unexpected error from GetRepositoryPolicy.
-type erroringECR struct {
-	inner *fakeECR
-}
-
-func (e *erroringECR) CreateRepository(ctx context.Context, params *ecr.CreateRepositoryInput, optFns ...func(*ecr.Options)) (*ecr.CreateRepositoryOutput, error) {
-	return e.inner.CreateRepository(ctx, params, optFns...)
-}
-
-func (e *erroringECR) GetRepositoryPolicy(_ context.Context, _ *ecr.GetRepositoryPolicyInput, _ ...func(*ecr.Options)) (*ecr.GetRepositoryPolicyOutput, error) {
-	return nil, errors.New("unexpected AWS error")
-}
-
-func (e *erroringECR) SetRepositoryPolicy(ctx context.Context, params *ecr.SetRepositoryPolicyInput, optFns ...func(*ecr.Options)) (*ecr.SetRepositoryPolicyOutput, error) {
-	return e.inner.SetRepositoryPolicy(ctx, params, optFns...)
-}
-
-func (e *erroringECR) GetLifecyclePolicy(ctx context.Context, params *ecr.GetLifecyclePolicyInput, optFns ...func(*ecr.Options)) (*ecr.GetLifecyclePolicyOutput, error) {
-	return e.inner.GetLifecyclePolicy(ctx, params, optFns...)
-}
-
-func (e *erroringECR) PutLifecyclePolicy(ctx context.Context, params *ecr.PutLifecyclePolicyInput, optFns ...func(*ecr.Options)) (*ecr.PutLifecyclePolicyOutput, error) {
-	return e.inner.PutLifecyclePolicy(ctx, params, optFns...)
 }
 
 // --- existing tests ---
