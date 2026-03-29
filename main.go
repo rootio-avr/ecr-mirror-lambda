@@ -41,17 +41,26 @@ const (
 )
 
 type Config struct {
-	WebhookSecretARN string `env:"WEBHOOK_SECRET_ARN,required"`
-	RootAPIKeyARN    string `env:"ROOT_API_KEY_ARN,required"`
-	DstRepoURL       string `env:"DST_REPO_URL,required"`
-	RegistryHost     string `env:"ROOT_REGISTRY_HOST" envDefault:"cr.root.io"`
+	WebhookSecretARN string   `env:"WEBHOOK_SECRET_ARN,required"`
+	RootAPIKeyARN    string   `env:"ROOT_API_KEY_ARN,required"`
+	DstRepoURL       string   `env:"DST_REPO_URL,required"`
+	RegistryHost     string   `env:"ROOT_REGISTRY_HOST" envDefault:"cr.root.io"`
+	AllowedRepos     []string `env:"ALLOWED_REPOS" envSeparator:","`
+}
+
+type ecrAPI interface {
+	CreateRepository(ctx context.Context, params *ecr.CreateRepositoryInput, optFns ...func(*ecr.Options)) (*ecr.CreateRepositoryOutput, error)
+	GetRepositoryPolicy(ctx context.Context, params *ecr.GetRepositoryPolicyInput, optFns ...func(*ecr.Options)) (*ecr.GetRepositoryPolicyOutput, error)
+	SetRepositoryPolicy(ctx context.Context, params *ecr.SetRepositoryPolicyInput, optFns ...func(*ecr.Options)) (*ecr.SetRepositoryPolicyOutput, error)
+	GetLifecyclePolicy(ctx context.Context, params *ecr.GetLifecyclePolicyInput, optFns ...func(*ecr.Options)) (*ecr.GetLifecyclePolicyOutput, error)
+	PutLifecyclePolicy(ctx context.Context, params *ecr.PutLifecyclePolicyInput, optFns ...func(*ecr.Options)) (*ecr.PutLifecyclePolicyOutput, error)
 }
 
 type Handler struct {
 	webhookSecret string
 	cfg           Config
 	dstRepoName   string
-	ecrClient     *ecr.Client
+	ecrClient     ecrAPI
 	keychain      authn.Keychain
 }
 
@@ -150,6 +159,11 @@ func (h *Handler) Handle(ctx context.Context, req events.LambdaFunctionURLReques
 
 	src := ce.Subject()
 
+	if !h.isRepoAllowed(data.ImageRepo) {
+		log.Info("repo not in allowlist, skipping", "repo", data.ImageRepo)
+		return respond(http.StatusOK, "repo not allowed")
+	}
+
 	ecrRepoName := fmt.Sprintf("%s/%s", h.dstRepoName, data.ImageRepo)
 	if err := h.ensureECRRepo(ctx, ecrRepoName); err != nil {
 		log.Error("failed to ensure ECR repo", "error", err, "repo", ecrRepoName)
@@ -221,6 +235,7 @@ func (h *Handler) verifySignature(req events.LambdaFunctionURLRequest) error {
 // --- ECR helpers ---
 
 func (h *Handler) ensureECRRepo(ctx context.Context, repoName string) error {
+	slog.Debug("creating repo...", "repo", repoName)
 	_, err := h.ecrClient.CreateRepository(ctx, &ecr.CreateRepositoryInput{
 		RepositoryName:     &repoName,
 		ImageTagMutability: ecrtypes.ImageTagMutabilityMutable,
@@ -228,12 +243,88 @@ func (h *Handler) ensureECRRepo(ctx context.Context, repoName string) error {
 	if err != nil {
 		var exists *ecrtypes.RepositoryAlreadyExistsException
 		if errors.As(err, &exists) {
+			slog.Debug("repo already exists, skipping creation", "repo", repoName)
 			return nil
 		}
 		return fmt.Errorf("creating ECR repo %s: %w", repoName, err)
 	}
 	slog.Info("created ECR repo", "repo", repoName)
+
+	slog.Debug("copying repo policy...", "baseRepo", h.dstRepoName, "repo", repoName)
+	if err := h.copyRepoPolicy(ctx, repoName); err != nil {
+		return err
+	}
+	slog.Debug("copied repo policy", "baseRepo", h.dstRepoName, "repo", repoName)
+
+	slog.Debug("copying lifecycle policy...", "baseRepo", h.dstRepoName, "repo", repoName)
+	if err := h.copyLifecyclePolicy(ctx, repoName); err != nil {
+		return err
+	}
+	slog.Debug("copied lifecycle policy", "baseRepo", h.dstRepoName, "repo", repoName)
+
 	return nil
+}
+
+func (h *Handler) copyRepoPolicy(ctx context.Context, newRepo string) error {
+	slog.Debug("getting repo policy...", "baseRepo", h.dstRepoName)
+	out, err := h.ecrClient.GetRepositoryPolicy(ctx, &ecr.GetRepositoryPolicyInput{
+		RepositoryName: &h.dstRepoName,
+	})
+	if err != nil {
+		var notFound *ecrtypes.RepositoryPolicyNotFoundException
+		if errors.As(err, &notFound) {
+			slog.Debug("no repo policy found in base repo, skipping", "baseRepo", h.dstRepoName)
+			return nil
+		}
+		return fmt.Errorf("getting repo policy from base repo: %w", err)
+	}
+
+	slog.Debug("setting repo policy...", "baseRepo", h.dstRepoName, "repo", newRepo)
+	_, err = h.ecrClient.SetRepositoryPolicy(ctx, &ecr.SetRepositoryPolicyInput{
+		RepositoryName: &newRepo,
+		PolicyText:     out.PolicyText,
+	})
+	return err
+}
+
+func (h *Handler) copyLifecyclePolicy(ctx context.Context, newRepo string) error {
+	slog.Debug("getting lifecycle policy...", "repo", h.dstRepoName)
+	out, err := h.ecrClient.GetLifecyclePolicy(ctx, &ecr.GetLifecyclePolicyInput{
+		RepositoryName: &h.dstRepoName,
+	})
+	if err != nil {
+		var notFound *ecrtypes.LifecyclePolicyNotFoundException
+		if errors.As(err, &notFound) {
+			slog.Debug("no lifecycle policy found in base repo, skipping", "repo", h.dstRepoName)
+			return nil
+		}
+		return fmt.Errorf("getting lifecycle policy from base repo: %w", err)
+	}
+
+	slog.Debug("setting lifecycle policy...", "baseRepo", h.dstRepoName, "repo", newRepo)
+	_, err = h.ecrClient.PutLifecyclePolicy(ctx, &ecr.PutLifecyclePolicyInput{
+		RepositoryName:      &newRepo,
+		LifecyclePolicyText: out.LifecyclePolicyText,
+	})
+	return err
+}
+
+func (h *Handler) isRepoAllowed(repo string) bool {
+	log := slog.With("repo", repo)
+	if len(h.cfg.AllowedRepos) == 0 {
+		log.Debug("no AllowedRepos configured, allowing all repos")
+		return true
+	}
+	for _, allowedRepo := range h.cfg.AllowedRepos {
+		log.Debug("checking AllowedRepos", "allowedRepo", allowedRepo)
+		if allowedRepo == repo {
+			log.Debug("repo allowed", "allowedRepo", allowedRepo)
+			return true
+		}
+	}
+	log.Debug("repo not allowed")
+
+	return false
 }
 
 // --- Auth ---

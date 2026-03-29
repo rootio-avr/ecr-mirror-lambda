@@ -73,6 +73,7 @@ jobs:
 
           MSG_ID="whmsg_e2e_${{ github.run_id }}"
           TIMESTAMP=$(date +%s)
+          echo "WEBHOOK_START_MS=$(( TIMESTAMP * 1000 ))" >> $GITHUB_ENV
           SIGNED="${MSG_ID}.${TIMESTAMP}.${BODY}"
           SIGNATURE="v1,$(echo -n "$SIGNED" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $2}')"
 
@@ -91,6 +92,17 @@ jobs:
             echo "::error::Webhook returned $HTTP_CODE"
             exit 1
           fi
+
+      - name: Fetch Lambda logs
+        if: always()
+        run: |
+          echo "=== Lambda logs ==="
+          aws logs filter-log-events \
+            --log-group-name /aws/lambda/root-ecr-mirror \
+            --start-time "$WEBHOOK_START_MS" \
+            --region $AWS_REGION \
+            --query 'events[*].message' \
+            --output text
 
       - name: Verify image in ECR
         run: |
