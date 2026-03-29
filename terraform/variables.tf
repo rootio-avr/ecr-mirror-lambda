@@ -34,6 +34,12 @@ variable "root_api_key" {
   description = "Root API key for authenticating pulls from cr.root.io."
 }
 
+variable "allowed_repos" {
+  type        = list(string)
+  description = "Repos to mirror (e.g. [\"python\", \"golang\"]). Leave empty to mirror all repos."
+  default     = []
+}
+
 variable "log_retention_days" {
   type        = number
   description = "CloudWatch log group retention in days."

@@ -23,6 +23,10 @@ data "aws_iam_policy_document" "lambda_permissions" {
       "ecr:UploadLayerPart",
       "ecr:CompleteLayerUpload",
       "ecr:PutImage",
+      "ecr:GetRepositoryPolicy",
+      "ecr:SetRepositoryPolicy",
+      "ecr:GetLifecyclePolicy",
+      "ecr:PutLifecyclePolicy",
     ]
     resources = [
       aws_ecr_repository.root_mirror.arn,
@@ -86,6 +90,7 @@ resource "aws_lambda_function" "mirror" {
       DST_REPO_URL              = aws_ecr_repository.root_mirror.repository_url
       ROOT_REGISTRY_HOST        = var.root_registry_host
       WEBHOOK_SECRET_CONFIGURED = var.webhook_signing_secret != "" ? "true" : "false"
+      ALLOWED_REPOS             = join(",", var.allowed_repos)
     }
   }
 
