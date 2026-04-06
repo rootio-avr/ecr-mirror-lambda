@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/ecr"
 	ecrtypes "github.com/aws/aws-sdk-go-v2/service/ecr/types"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
@@ -25,6 +27,7 @@ import (
 	cloudevents "github.com/cloudevents/sdk-go/v2/event"
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/crane"
+	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 )
 
@@ -46,6 +49,7 @@ type Config struct {
 	DstRepoURL       string   `env:"DST_REPO_URL,required"`
 	RegistryHost     string   `env:"ROOT_REGISTRY_HOST" envDefault:"cr.root.io"`
 	AllowedRepos     []string `env:"ALLOWED_REPOS" envSeparator:","`
+	DynamoLockTable  string `env:"DYNAMO_LOCK_TABLE,required"`
 }
 
 type ecrAPI interface {
@@ -62,6 +66,9 @@ type Handler struct {
 	dstRepoName   string
 	ecrClient     ecrAPI
 	keychain      authn.Keychain
+	dynamoClient  dynamoLockClient
+	nameOpts      []name.Option  // e.g. name.Insecure for tests
+	craneOpts     []crane.Option // applied to crane.Copy calls only; use nameOpts for remote.Get/WriteIndex transport
 }
 
 func NewHandler(ctx context.Context) (*Handler, error) {
@@ -105,6 +112,7 @@ func NewHandler(ctx context.Context) (*Handler, error) {
 		dstRepoName:   dstRepoName,
 		ecrClient:     ecr.NewFromConfig(awsCfg),
 		keychain:      authn.NewMultiKeychain(rootKeychain, amazonKeychain),
+		dynamoClient:  dynamodb.NewFromConfig(awsCfg),
 	}, nil
 }
 
@@ -139,7 +147,6 @@ func (h *Handler) Handle(ctx context.Context, req events.LambdaFunctionURLReques
 	}
 
 	log := slog.With("webhook_id", req.Headers[headerWebhookID], "event_id", ce.ID())
-
 	log.Info("received event",
 		"type", ce.Type(),
 		"subject", ce.Subject(),
@@ -170,19 +177,45 @@ func (h *Handler) Handle(ctx context.Context, req events.LambdaFunctionURLReques
 		return respond(http.StatusInternalServerError, "internal error")
 	}
 
-	dst := fmt.Sprintf("%s/%s:%s", h.cfg.DstRepoURL, data.ImageRepo, data.ImageTag)
+	if data.Arch == "" {
+		dst := fmt.Sprintf("%s/%s:%s", h.cfg.DstRepoURL, data.ImageRepo, data.ImageTag)
+		log.Info("copying image (no arch)", "src", src, "dst", dst)
+		opts := slices.Concat(buildCopyOptions(ctx, h.keychain, ""), h.craneOpts)
+		if err := crane.Copy(src, dst, opts...); err != nil {
+			log.Error("failed to copy image", "error", err)
+			return respond(http.StatusInternalServerError, "image copy failed")
+		}
+		log.Info("image copied successfully", "dst", dst)
+		return respond(http.StatusOK, "ok")
+	}
 
-	log.Info("copying image", "src", src, "dst", dst)
-	if err := crane.Copy(src, dst, buildCopyOptions(h.keychain, ctx, data.Arch)...); err != nil {
-		log.Error("failed to copy image", "error", err, "src", src, "dst", dst)
+	archDst := fmt.Sprintf("%s/%s:%s-%s", h.cfg.DstRepoURL, data.ImageRepo, data.ImageTag, data.Arch)
+	log.Info("copying arch image", "src", src, "dst", archDst, "arch", data.Arch)
+	opts := slices.Concat(buildCopyOptions(ctx, h.keychain, data.Arch), h.craneOpts)
+	if err := crane.Copy(src, archDst, opts...); err != nil {
+		log.Error("failed to copy arch image", "error", err)
 		return respond(http.StatusInternalServerError, "image copy failed")
 	}
 
-	log.Info("image copied successfully", "src", src, "dst", dst)
+	lockKey := fmt.Sprintf("%s:%s", data.ImageRepo, data.ImageTag)
+	if err := acquireLock(ctx, h.dynamoClient, h.cfg.DynamoLockTable, lockKey); err != nil {
+		log.Error("failed to acquire lock", "key", lockKey, "error", err)
+		return respond(http.StatusInternalServerError, "lock acquisition failed")
+	}
+	defer releaseLock(ctx, h.dynamoClient, h.cfg.DynamoLockTable, lockKey)
+
+	indexDst := fmt.Sprintf("%s/%s:%s", h.cfg.DstRepoURL, data.ImageRepo, data.ImageTag)
+	log.Info("updating image index", "index_dst", indexDst, "arch_src", archDst)
+	if err := updateImageIndex(ctx, h.keychain, archDst, indexDst, data.Arch, h.nameOpts...); err != nil {
+		log.Error("failed to update image index", "error", err)
+		return respond(http.StatusInternalServerError, "index update failed")
+	}
+
+	log.Info("image index updated successfully", "dst", indexDst, "arch", data.Arch)
 	return respond(http.StatusOK, "ok")
 }
 
-func buildCopyOptions(keychain authn.Keychain, ctx context.Context, arch string) []crane.Option {
+func buildCopyOptions(ctx context.Context, keychain authn.Keychain, arch string) []crane.Option {
 	opts := []crane.Option{
 		crane.WithAuthFromKeychain(keychain),
 		crane.WithContext(ctx),
@@ -235,6 +268,9 @@ func (h *Handler) verifySignature(req events.LambdaFunctionURLRequest) error {
 // --- ECR helpers ---
 
 func (h *Handler) ensureECRRepo(ctx context.Context, repoName string) error {
+	if h.ecrClient == nil {
+		return nil
+	}
 	slog.Debug("creating repo...", "repo", repoName)
 	_, err := h.ecrClient.CreateRepository(ctx, &ecr.CreateRepositoryInput{
 		RepositoryName:     &repoName,

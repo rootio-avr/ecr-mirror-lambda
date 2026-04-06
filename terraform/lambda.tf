@@ -52,6 +52,16 @@ data "aws_iam_policy_document" "lambda_permissions" {
       aws_secretsmanager_secret.root_api_key.arn,
     ]
   }
+
+  statement {
+    sid    = "DynamoDBLock"
+    effect = "Allow"
+    actions = [
+      "dynamodb:PutItem",
+      "dynamodb:DeleteItem",
+    ]
+    resources = [aws_dynamodb_table.mirror_locks.arn]
+  }
 }
 
 resource "aws_iam_role" "lambda" {
@@ -91,6 +101,7 @@ resource "aws_lambda_function" "mirror" {
       ROOT_REGISTRY_HOST        = var.root_registry_host
       WEBHOOK_SECRET_CONFIGURED = var.webhook_signing_secret != "" ? "true" : "false"
       ALLOWED_REPOS             = join(",", var.allowed_repos)
+      DYNAMO_LOCK_TABLE         = aws_dynamodb_table.mirror_locks.name
     }
   }
 
