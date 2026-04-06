@@ -320,7 +320,7 @@ func TestBuildCopyOptions(t *testing.T) {
 
 	t.Run("with arch copies single platform image", func(t *testing.T) {
 		dstTagStr := dstHost + "/test/single-arch:latest"
-		opts := append(buildCopyOptions(authn.DefaultKeychain, context.Background(), "amd64"), crane.Insecure)
+		opts := append(buildCopyOptions(context.Background(), authn.DefaultKeychain, "amd64"), crane.Insecure)
 		if err := crane.Copy(srcTagStr, dstTagStr, opts...); err != nil {
 			t.Fatalf("copying: %v", err)
 		}
@@ -337,7 +337,7 @@ func TestBuildCopyOptions(t *testing.T) {
 
 	t.Run("without arch copies full image index", func(t *testing.T) {
 		dstTagStr := dstHost + "/test/multi-arch:latest"
-		opts := append(buildCopyOptions(authn.DefaultKeychain, context.Background(), ""), crane.Insecure)
+		opts := append(buildCopyOptions(context.Background(), authn.DefaultKeychain, ""), crane.Insecure)
 		if err := crane.Copy(srcTagStr, dstTagStr, opts...); err != nil {
 			t.Fatalf("copying: %v", err)
 		}
