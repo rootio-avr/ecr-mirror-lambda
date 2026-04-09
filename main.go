@@ -163,6 +163,7 @@ func (h *Handler) Handle(ctx context.Context, req events.LambdaFunctionURLReques
 	}
 
 	log := slog.With("webhook_id", req.Headers[headerWebhookID], "event_id", ce.ID())
+
 	log.Info("received event",
 		"type", ce.Type(),
 		"subject", ce.Subject(),

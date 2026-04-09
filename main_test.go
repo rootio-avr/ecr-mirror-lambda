@@ -16,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ecr"
 	ecrtypes "github.com/aws/aws-sdk-go-v2/service/ecr/types"
 	"github.com/aws/aws-lambda-go/events"
+	cloudevents "github.com/cloudevents/sdk-go/v2/event"
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/crane"
 	"github.com/google/go-containerregistry/pkg/name"
@@ -182,13 +183,18 @@ func TestEnsureECRRepo(t *testing.T) {
 
 // --- existing tests ---
 
+const (
+	imageByteSize = 512
+	imageLayers   = 2
+)
+
 func makeMultiArchIndex(t *testing.T) v1.ImageIndex {
 	t.Helper()
-	amd64Img, err := random.Image(512, 2)
+	amd64Img, err := random.Image(imageByteSize, imageLayers)
 	if err != nil {
 		t.Fatalf("creating amd64 image: %v", err)
 	}
-	arm64Img, err := random.Image(512, 2)
+	arm64Img, err := random.Image(imageByteSize, imageLayers)
 	if err != nil {
 		t.Fatalf("creating arm64 image: %v", err)
 	}
@@ -250,11 +256,19 @@ func TestHandle_MultiArch(t *testing.T) {
 
 	sendEvent := func(arch string) {
 		t.Helper()
-		body := fmt.Sprintf(
-			`{"specversion":"1.0","type":"io.root.cr.image.created.v1","source":"https://src","id":"evt1","time":"2026-01-01T00:00:00Z","subject":%q,"datacontenttype":"application/json","data":{"image_repo":"library/nginx","image_tag":"v1","arch":%q}}`,
-			srcHost+"/library/nginx:v1", arch,
-		)
-		req := signRequest(t, "test-secret", "id1", body)
+		ce := cloudevents.New()
+		ce.SetType(imageCreatedEvent)
+		ce.SetSource("https://src")
+		ce.SetID("evt1")
+		ce.SetSubject(srcHost + "/library/nginx:v1")
+		if err := ce.SetData("application/json", ImageEventData{ImageRepo: "library/nginx", ImageTag: "v1", Arch: arch}); err != nil {
+			t.Fatalf("marshaling event data: %v", err)
+		}
+		body, err := ce.MarshalJSON()
+		if err != nil {
+			t.Fatalf("marshaling cloud event: %v", err)
+		}
+		req := signRequest(t, "test-secret", "id1", string(body))
 		resp, err := h.Handle(context.Background(), req)
 		if err != nil || resp.StatusCode != 200 {
 			t.Fatalf("Handle(%s): err=%v status=%d body=%s", arch, err, resp.StatusCode, resp.Body)
