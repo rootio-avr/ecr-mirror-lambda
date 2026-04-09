@@ -57,7 +57,9 @@ data "aws_iam_policy_document" "lambda_permissions" {
     sid    = "DynamoDBLock"
     effect = "Allow"
     actions = [
+      "dynamodb:GetItem",
       "dynamodb:PutItem",
+      "dynamodb:UpdateItem",
       "dynamodb:DeleteItem",
     ]
     resources = [aws_dynamodb_table.mirror_locks.arn]
