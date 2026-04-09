@@ -236,19 +236,16 @@ func TestHandle_MultiArch(t *testing.T) {
 		t.Fatalf("pushing source index: %v", err)
 	}
 
-	dynamo := newMockDynamo()
 	h := &Handler{
 		webhookSecret: "test-secret",
 		cfg: Config{
-			DstRepoURL:      dstHost + "/mirror",
-			RegistryHost:    srcHost,
-			DynamoLockTable: "test-table",
+			DstRepoURL:   dstHost + "/mirror",
+			RegistryHost: srcHost,
 		},
-		dstRepoName:  "mirror",
-		dynamoClient: dynamo,
-		keychain:     authn.DefaultKeychain,
-		nameOpts:     []name.Option{name.Insecure},
-		craneOpts:    []crane.Option{crane.Insecure},
+		dstRepoName: "mirror",
+		keychain:    authn.DefaultKeychain,
+		nameOpts:    []name.Option{name.Insecure},
+		craneOpts:   []crane.Option{crane.Insecure},
 	}
 
 	sendEvent := func(arch string) {

@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"cirello.io/dynamolock/v2"
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -32,6 +33,11 @@ import (
 )
 
 const (
+	lockLeaseDuration = 60 * time.Second
+	lockHeartbeat     = 10 * time.Second
+	lockRetryDelay    = 1 * time.Second
+	lockTimeout       = 30 * time.Second
+
 	maxTimestampAge   = 300 // seconds
 	signaturePrefix   = "v1,"
 	imageCreatedEvent = "io.root.cr.image.created.v1"
@@ -66,7 +72,7 @@ type Handler struct {
 	dstRepoName   string
 	ecrClient     ecrAPI
 	keychain      authn.Keychain
-	dynamoClient  dynamoLockClient
+	lockClient    *dynamolock.Client
 	nameOpts      []name.Option  // e.g. name.Insecure for tests
 	craneOpts     []crane.Option // applied to crane.Copy calls only; use nameOpts for remote.Get/WriteIndex transport
 }
@@ -106,13 +112,23 @@ func NewHandler(ctx context.Context) (*Handler, error) {
 		dstRepoName = cfg.DstRepoURL[i+1:]
 	}
 
+	lockClient, err := dynamolock.New(
+		dynamodb.NewFromConfig(awsCfg),
+		cfg.DynamoLockTable,
+		dynamolock.WithLeaseDuration(lockLeaseDuration),
+		dynamolock.WithHeartbeatPeriod(lockHeartbeat),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("creating lock client: %w", err)
+	}
+
 	return &Handler{
 		webhookSecret: webhookSecret,
 		cfg:           cfg,
 		dstRepoName:   dstRepoName,
 		ecrClient:     ecr.NewFromConfig(awsCfg),
 		keychain:      authn.NewMultiKeychain(rootKeychain, amazonKeychain),
-		dynamoClient:  dynamodb.NewFromConfig(awsCfg),
+		lockClient:    lockClient,
 	}, nil
 }
 
@@ -198,11 +214,12 @@ func (h *Handler) Handle(ctx context.Context, req events.LambdaFunctionURLReques
 	}
 
 	lockKey := fmt.Sprintf("%s:%s", data.ImageRepo, data.ImageTag)
-	if err := acquireLock(ctx, h.dynamoClient, h.cfg.DynamoLockTable, lockKey); err != nil {
+	unlock, err := h.lock(ctx, lockKey)
+	if err != nil {
 		log.Error("failed to acquire lock", "key", lockKey, "error", err)
 		return respond(http.StatusInternalServerError, "lock acquisition failed")
 	}
-	defer releaseLock(ctx, h.dynamoClient, h.cfg.DynamoLockTable, lockKey)
+	defer unlock()
 
 	indexDst := fmt.Sprintf("%s/%s:%s", h.cfg.DstRepoURL, data.ImageRepo, data.ImageTag)
 	log.Info("updating image index", "index_dst", indexDst, "arch_src", archDst)
@@ -397,6 +414,22 @@ func getSecret(ctx context.Context, sm *secretsmanager.Client, arn string) (stri
 		return "", fmt.Errorf("getting secret %s: %w", arn, err)
 	}
 	return *out.SecretString, nil
+}
+
+func (h *Handler) lock(ctx context.Context, key string) (func(), error) {
+	if h.lockClient == nil {
+		return func() {}, nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, lockTimeout)
+	defer cancel()
+	lock, err := h.lockClient.AcquireLockWithContext(ctx, key,
+		dynamolock.WithRefreshPeriod(lockRetryDelay),
+		dynamolock.WithDeleteLockOnRelease(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("acquiring lock %q: %w", key, err)
+	}
+	return func() { lock.Close() }, nil
 }
 
 func respond(status int, body string) (events.LambdaFunctionURLResponse, error) {
