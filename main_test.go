@@ -2,13 +2,20 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-sdk-go-v2/service/ecr"
 	ecrtypes "github.com/aws/aws-sdk-go-v2/service/ecr/types"
+	cloudevents "github.com/cloudevents/sdk-go/v2/event"
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/crane"
 	"github.com/google/go-containerregistry/pkg/name"
@@ -175,13 +182,18 @@ func TestEnsureECRRepo(t *testing.T) {
 
 // --- existing tests ---
 
+const (
+	imageByteSize = 512
+	imageLayers   = 2
+)
+
 func makeMultiArchIndex(t *testing.T) v1.ImageIndex {
 	t.Helper()
-	amd64Img, err := random.Image(512, 2)
+	amd64Img, err := random.Image(imageByteSize, imageLayers)
 	if err != nil {
 		t.Fatalf("creating amd64 image: %v", err)
 	}
-	arm64Img, err := random.Image(512, 2)
+	arm64Img, err := random.Image(imageByteSize, imageLayers)
 	if err != nil {
 		t.Fatalf("creating arm64 image: %v", err)
 	}
@@ -195,6 +207,104 @@ func makeMultiArchIndex(t *testing.T) v1.ImageIndex {
 			Descriptor: v1.Descriptor{Platform: &v1.Platform{OS: "linux", Architecture: "arm64"}},
 		},
 	)
+}
+
+func signRequest(t *testing.T, secret, id, body string) events.LambdaFunctionURLRequest {
+	t.Helper()
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(id + "." + ts + "." + body))
+	sig := "v1," + hex.EncodeToString(mac.Sum(nil))
+	return events.LambdaFunctionURLRequest{
+		Body: body,
+		Headers: map[string]string{
+			"webhook-id":        id,
+			"webhook-timestamp": ts,
+			"webhook-signature": sig,
+		},
+	}
+}
+
+func TestHandle_MultiArch(t *testing.T) {
+	srcSrv := httptest.NewServer(registry.New())
+	defer srcSrv.Close()
+	srcHost := strings.TrimPrefix(srcSrv.URL, "http://")
+
+	dstSrv := httptest.NewServer(registry.New())
+	defer dstSrv.Close()
+	dstHost := strings.TrimPrefix(dstSrv.URL, "http://")
+
+	// Push multi-arch index to source so crane.Copy can resolve platform variants.
+	idx := makeMultiArchIndex(t)
+	srcRef, _ := name.NewTag(srcHost+"/library/nginx:v1", name.Insecure)
+	if err := remote.WriteIndex(srcRef, idx, remote.WithAuthFromKeychain(authn.DefaultKeychain)); err != nil {
+		t.Fatalf("pushing source index: %v", err)
+	}
+
+	h := &Handler{
+		webhookSecret: "test-secret",
+		cfg: Config{
+			DstRepoURL:   dstHost + "/mirror",
+			RegistryHost: srcHost,
+		},
+		dstRepoName: "mirror",
+		keychain:    authn.DefaultKeychain,
+		nameOpts:    []name.Option{name.Insecure},
+		craneOpts:   []crane.Option{crane.Insecure},
+	}
+
+	sendEvent := func(arch string) {
+		t.Helper()
+		ce := cloudevents.New()
+		ce.SetType(imageCreatedEvent)
+		ce.SetSource("https://src")
+		ce.SetID("evt1")
+		ce.SetSubject(srcHost + "/library/nginx:v1")
+		if err := ce.SetData("application/json", ImageEventData{ImageRepo: "library/nginx", ImageTag: "v1", Arch: arch}); err != nil {
+			t.Fatalf("marshaling event data: %v", err)
+		}
+		body, err := ce.MarshalJSON()
+		if err != nil {
+			t.Fatalf("marshaling cloud event: %v", err)
+		}
+		req := signRequest(t, "test-secret", "id1", string(body))
+		resp, err := h.Handle(context.Background(), req)
+		if err != nil || resp.StatusCode != 200 {
+			t.Fatalf("Handle(%s): err=%v status=%d body=%s", arch, err, resp.StatusCode, resp.Body)
+		}
+	}
+
+	sendEvent("amd64")
+	sendEvent("arm64")
+
+	// Each arch must have its own tagged image.
+	for _, arch := range []string{"amd64", "arm64"} {
+		archRef, _ := name.NewTag(dstHost+"/mirror/library/nginx:v1-"+arch, name.Insecure)
+		if _, err := remote.Get(archRef, remote.WithAuthFromKeychain(authn.DefaultKeychain)); err != nil {
+			t.Errorf("arch-tagged image v1-%s not found: %v", arch, err)
+		}
+	}
+
+	// Base tag must be an OCI Image Index referencing both arches.
+	indexRef, _ := name.NewTag(dstHost+"/mirror/library/nginx:v1", name.Insecure)
+	desc, err := remote.Get(indexRef, remote.WithAuthFromKeychain(authn.DefaultKeychain))
+	if err != nil {
+		t.Fatalf("base tag not found: %v", err)
+	}
+	idx2, err := desc.ImageIndex()
+	if err != nil {
+		t.Fatalf("base tag is not an image index: %v", err)
+	}
+	manifest, _ := idx2.IndexManifest()
+	archs := make(map[string]bool)
+	for _, m := range manifest.Manifests {
+		if m.Platform != nil {
+			archs[m.Platform.Architecture] = true
+		}
+	}
+	if !archs["amd64"] || !archs["arm64"] {
+		t.Errorf("expected amd64 and arm64 in index, got: %v", archs)
+	}
 }
 
 func TestBuildCopyOptions(t *testing.T) {
@@ -220,7 +330,7 @@ func TestBuildCopyOptions(t *testing.T) {
 
 	t.Run("with arch copies single platform image", func(t *testing.T) {
 		dstTagStr := dstHost + "/test/single-arch:latest"
-		opts := append(buildCopyOptions(authn.DefaultKeychain, context.Background(), "amd64"), crane.Insecure)
+		opts := append(buildCopyOptions(context.Background(), authn.DefaultKeychain, "amd64"), crane.Insecure)
 		if err := crane.Copy(srcTagStr, dstTagStr, opts...); err != nil {
 			t.Fatalf("copying: %v", err)
 		}
@@ -237,7 +347,7 @@ func TestBuildCopyOptions(t *testing.T) {
 
 	t.Run("without arch copies full image index", func(t *testing.T) {
 		dstTagStr := dstHost + "/test/multi-arch:latest"
-		opts := append(buildCopyOptions(authn.DefaultKeychain, context.Background(), ""), crane.Insecure)
+		opts := append(buildCopyOptions(context.Background(), authn.DefaultKeychain, ""), crane.Insecure)
 		if err := crane.Copy(srcTagStr, dstTagStr, opts...); err != nil {
 			t.Fatalf("copying: %v", err)
 		}
