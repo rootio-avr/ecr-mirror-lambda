@@ -67,7 +67,7 @@ data "aws_iam_policy_document" "lambda_permissions" {
 }
 
 resource "aws_iam_role" "lambda" {
-  name               = "root-ecr-mirror"
+  name               = local.name
   assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
 }
 
@@ -83,12 +83,12 @@ resource "aws_iam_role_policy" "lambda" {
 }
 
 resource "aws_cloudwatch_log_group" "lambda" {
-  name              = "/aws/lambda/root-ecr-mirror"
+  name              = "/aws/lambda/${local.name}"
   retention_in_days = var.log_retention_days
 }
 
 resource "aws_lambda_function" "mirror" {
-  function_name = "root-ecr-mirror"
+  function_name = local.name
   role          = aws_iam_role.lambda.arn
   package_type  = "Image"
   image_uri     = var.lambda_image_uri

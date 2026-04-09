@@ -14,8 +14,9 @@ permissions:
 env:
   AWS_REGION: us-east-1
   LAMBDA_REPO: root-ecr-mirror-lambda
-  DST_REPO: root-mirror-e2e
+  DST_REPO: root-mirror-e2e-${{ github.run_id }}
   TEST_IMAGE: python:3.13
+  NAME_SUFFIX: ${{ github.run_id }}
 
 jobs:
   e2e:
@@ -49,18 +50,21 @@ jobs:
         working-directory: terraform
         env:
           TF_VAR_aws_region: ${{ env.AWS_REGION }}
-          TF_VAR_dst_repo: root-mirror-e2e
+          TF_VAR_dst_repo: ${{ env.DST_REPO }}
           TF_VAR_lambda_image_uri: ${{ env.LAMBDA_IMAGE }}
           TF_VAR_webhook_signing_secret: ${{ secrets.TEST_WEBHOOK_SECRET }}
           TF_VAR_root_api_key: ${{ secrets.TEST_ROOT_API_KEY }}
+          TF_VAR_name_suffix: ${{ env.NAME_SUFFIX }}
         run: |
           terraform init
           terraform apply -auto-approve
           echo "WEBHOOK_URL=$(terraform output -raw webhook_url)" >> $GITHUB_ENV
+          echo "LOG_GROUP=$(terraform output -raw log_group_name)" >> $GITHUB_ENV
+          echo "LAMBDA_FUNCTION=$(terraform output -raw lambda_function_name)" >> $GITHUB_ENV
 
       - name: Wait for Lambda to be ready
         run: |
-          aws lambda wait function-active-v2 --function-name root-ecr-mirror --region $AWS_REGION
+          aws lambda wait function-active-v2 --function-name "$LAMBDA_FUNCTION" --region $AWS_REGION
 
       - name: Send test webhook
         env:
@@ -99,7 +103,7 @@ jobs:
           echo "=== Lambda logs ==="
           START_TIME="${WEBHOOK_START_MS:-$(( $(date +%s) * 1000 - 300000 ))}"
           aws logs filter-log-events \
-            --log-group-name /aws/lambda/root-ecr-mirror \
+            --log-group-name "$LOG_GROUP" \
             --start-time "$START_TIME" \
             --region $AWS_REGION \
             --query 'events[*].message' \
@@ -117,10 +121,11 @@ jobs:
         working-directory: terraform
         env:
           TF_VAR_aws_region: ${{ env.AWS_REGION }}
-          TF_VAR_dst_repo: root-mirror-e2e
+          TF_VAR_dst_repo: ${{ env.DST_REPO }}
           TF_VAR_lambda_image_uri: ${{ env.LAMBDA_IMAGE }}
           TF_VAR_webhook_signing_secret: ${{ secrets.TEST_WEBHOOK_SECRET }}
           TF_VAR_root_api_key: ${{ secrets.TEST_ROOT_API_KEY }}
+          TF_VAR_name_suffix: ${{ env.NAME_SUFFIX }}
         run: terraform destroy -auto-approve
 
       - name: Cleanup ECR repos
