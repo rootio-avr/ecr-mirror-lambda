@@ -55,7 +55,7 @@ type Config struct {
 	DstRepoURL       string   `env:"DST_REPO_URL,required"`
 	RegistryHost     string   `env:"ROOT_REGISTRY_HOST" envDefault:"cr.root.io"`
 	AllowedRepos     []string `env:"ALLOWED_REPOS" envSeparator:","`
-	DynamoLockTable  string `env:"DYNAMO_LOCK_TABLE,required"`
+	DynamoLockTable  string   `env:"DYNAMO_LOCK_TABLE,required"`
 }
 
 type ecrAPI interface {
@@ -430,7 +430,11 @@ func (h *Handler) lock(ctx context.Context, key string) (func(), error) {
 	if err != nil {
 		return nil, fmt.Errorf("acquiring lock %q: %w", key, err)
 	}
-	return func() { lock.Close() }, nil
+	return func() {
+		if err := lock.Close(); err != nil {
+			slog.Error("failed to release lock", "key", key, "error", err)
+		}
+	}, nil
 }
 
 func respond(status int, body string) (events.LambdaFunctionURLResponse, error) {
