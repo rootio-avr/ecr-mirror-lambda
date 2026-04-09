@@ -27,6 +27,20 @@ sequenceDiagram
 
 No long-lived credentials — the Lambda uses its IAM role for ECR and reads secrets from AWS Secrets Manager.
 
+## Multi-arch Images
+
+Root publishes multi-arch images by firing a separate webhook per architecture. The Lambda handles this safely:
+
+1. Each webhook copies its arch-specific image to ECR under a qualified tag: `{tag}-{arch}` (e.g. `3.13-amd64`, `3.13-arm64`)
+2. A distributed lock in DynamoDB (keyed on `{repo}:{tag}`) serialises concurrent arch events for the same tag
+3. The Lambda reads the existing OCI Image Index at `{tag}` from ECR (if any), adds or updates the entry for this arch, and pushes the updated index back under `{tag}`
+
+After all arch webhooks are processed, ECR contains:
+- `repo:{tag}` — an OCI Image Index referencing all mirrored arch variants
+- `repo:{tag}-{arch}` — an individual tagged image per arch (e.g. `3.13-amd64`, `3.13-arm64`)
+
+ECR lifecycle policies can target per-arch images using tag patterns like `*-amd64` or `*-arm64`.
+
 ## Prerequisites
 
 - **AWS CLI** — configured with an active profile ([install guide](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html))
