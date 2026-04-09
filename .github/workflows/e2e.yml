@@ -97,9 +97,10 @@ jobs:
         if: always()
         run: |
           echo "=== Lambda logs ==="
+          START_TIME="${WEBHOOK_START_MS:-$(( $(date +%s) * 1000 - 300000 ))}"
           aws logs filter-log-events \
             --log-group-name /aws/lambda/root-ecr-mirror \
-            --start-time "$WEBHOOK_START_MS" \
+            --start-time "$START_TIME" \
             --region $AWS_REGION \
             --query 'events[*].message' \
             --output text
