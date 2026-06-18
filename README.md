@@ -165,10 +165,20 @@ INFO copying image   webhook_id=whmsg_... src=cr.root.io/library/nginx:1.25.4-am
 INFO image copied successfully  webhook_id=whmsg_...
 ```
 
+With `normalize_repo = true`, the destination path uses the bare name instead:
+
+```
+INFO copying image   ... dst=123456789012.dkr.ecr.us-east-1.amazonaws.com/root-mirror/nginx:1.25.4-amd64-root
+```
+
 **Check ECR:**
 
 ```sh
+# default (normalize_repo = false)
 aws ecr list-images --repository-name root-mirror/library/nginx --region us-east-1
+
+# with normalize_repo = true
+aws ecr list-images --repository-name root-mirror/nginx --region us-east-1
 ```
 
 ## Teardown
@@ -195,6 +205,7 @@ This cleanly deletes the Lambda, IAM role, secrets, ECR repository, CloudWatch l
 | `webhook_signing_secret` | No | `""` | HMAC signing secret from your Root webhook subscription. Empty on first apply; set after Step 4 |
 | `root_api_key` | **Yes** | — | Root API key for pulling images from the Root registry |
 | `allowed_repos` | No | `[]` | Allowlist of image repos to mirror (e.g. `["python", "golang"]`). When empty, all repos are mirrored |
+| `normalize_repo` | No | `false` | Strip the `library/` prefix from Docker Hub official image repos (e.g. `library/python` → `python`) so ECR repo names match the bare image name. Set to `true` if your registry uses bare names |
 | `log_retention_days` | No | `14` | CloudWatch log retention in days |
 
 ### Repo Allowlist
