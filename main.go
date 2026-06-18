@@ -45,6 +45,10 @@ type Config struct {
 	RootAPIKeyARN    string `env:"ROOT_API_KEY_ARN,required"`
 	DstRepoURL       string `env:"DST_REPO_URL,required"`
 	RegistryHost     string `env:"ROOT_REGISTRY_HOST" envDefault:"cr.root.io"`
+	// NormalizeRepo strips the "library/" prefix from Docker Hub official image repos
+	// (e.g. "library/python" → "python") to match CCR naming conventions.
+	// Disabled by default to avoid breaking existing deployments.
+	NormalizeRepo bool `env:"NORMALIZE_REPO" envDefault:"false"`
 }
 
 type Handler struct {
@@ -149,14 +153,18 @@ func (h *Handler) Handle(ctx context.Context, req events.LambdaFunctionURLReques
 	}
 
 	src := ce.Subject()
+	canonicalRepo := data.ImageRepo
+	if h.cfg.NormalizeRepo {
+		canonicalRepo = normalizeRepo(canonicalRepo)
+	}
 
-	ecrRepoName := fmt.Sprintf("%s/%s", h.dstRepoName, data.ImageRepo)
+	ecrRepoName := fmt.Sprintf("%s/%s", h.dstRepoName, canonicalRepo)
 	if err := h.ensureECRRepo(ctx, ecrRepoName); err != nil {
 		log.Error("failed to ensure ECR repo", "error", err, "repo", ecrRepoName)
 		return respond(http.StatusInternalServerError, "internal error")
 	}
 
-	dst := fmt.Sprintf("%s/%s:%s", h.cfg.DstRepoURL, data.ImageRepo, data.ImageTag)
+	dst := fmt.Sprintf("%s/%s:%s", h.cfg.DstRepoURL, canonicalRepo, data.ImageTag)
 
 	log.Info("copying image", "src", src, "dst", dst)
 	if err := crane.Copy(src, dst, buildCopyOptions(h.keychain, ctx, data.Arch)...); err != nil {
@@ -166,6 +174,13 @@ func (h *Handler) Handle(ctx context.Context, req events.LambdaFunctionURLReques
 
 	log.Info("image copied successfully", "src", src, "dst", dst)
 	return respond(http.StatusOK, "ok")
+}
+
+// normalizeRepo maps Root's registry-style repo name to the CCR canonical form.
+// Docker Hub official images are prefixed "library/" in Root (e.g. "library/python")
+// but stored as bare names in CCR (e.g. "python"), matching rootio-config.json keys.
+func normalizeRepo(repo string) string {
+	return strings.TrimPrefix(repo, "library/")
 }
 
 func buildCopyOptions(keychain authn.Keychain, ctx context.Context, arch string) []crane.Option {
