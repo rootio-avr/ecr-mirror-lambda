@@ -10,13 +10,16 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
+	"cirello.io/dynamolock/v2"
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/ecr"
 	ecrtypes "github.com/aws/aws-sdk-go-v2/service/ecr/types"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
@@ -25,10 +28,16 @@ import (
 	cloudevents "github.com/cloudevents/sdk-go/v2/event"
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/crane"
+	"github.com/google/go-containerregistry/pkg/name"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 )
 
 const (
+	lockLeaseDuration = 60 * time.Second
+	lockHeartbeat     = 10 * time.Second
+	lockRetryDelay    = 1 * time.Second
+	lockTimeout       = 30 * time.Second
+
 	maxTimestampAge   = 300 // seconds
 	signaturePrefix   = "v1,"
 	imageCreatedEvent = "io.root.cr.image.created.v1"
@@ -41,22 +50,35 @@ const (
 )
 
 type Config struct {
-	WebhookSecretARN string `env:"WEBHOOK_SECRET_ARN,required"`
-	RootAPIKeyARN    string `env:"ROOT_API_KEY_ARN,required"`
-	DstRepoURL       string `env:"DST_REPO_URL,required"`
-	RegistryHost     string `env:"ROOT_REGISTRY_HOST" envDefault:"cr.root.io"`
+	WebhookSecretARN string   `env:"WEBHOOK_SECRET_ARN,required"`
+	RootAPIKeyARN    string   `env:"ROOT_API_KEY_ARN,required"`
+	DstRepoURL       string   `env:"DST_REPO_URL,required"`
+	RegistryHost     string   `env:"ROOT_REGISTRY_HOST" envDefault:"cr.root.io"`
+	AllowedRepos     []string `env:"ALLOWED_REPOS" envSeparator:","`
+	DynamoLockTable  string   `env:"DYNAMO_LOCK_TABLE,required"`
 	// NormalizeRepo strips the "library/" prefix from Docker Hub official image repos
 	// (e.g. "library/python" → "python") to match CCR naming conventions.
 	// Disabled by default to avoid breaking existing deployments.
 	NormalizeRepo bool `env:"NORMALIZE_REPO" envDefault:"false"`
 }
 
+type ecrAPI interface {
+	CreateRepository(ctx context.Context, params *ecr.CreateRepositoryInput, optFns ...func(*ecr.Options)) (*ecr.CreateRepositoryOutput, error)
+	GetRepositoryPolicy(ctx context.Context, params *ecr.GetRepositoryPolicyInput, optFns ...func(*ecr.Options)) (*ecr.GetRepositoryPolicyOutput, error)
+	SetRepositoryPolicy(ctx context.Context, params *ecr.SetRepositoryPolicyInput, optFns ...func(*ecr.Options)) (*ecr.SetRepositoryPolicyOutput, error)
+	GetLifecyclePolicy(ctx context.Context, params *ecr.GetLifecyclePolicyInput, optFns ...func(*ecr.Options)) (*ecr.GetLifecyclePolicyOutput, error)
+	PutLifecyclePolicy(ctx context.Context, params *ecr.PutLifecyclePolicyInput, optFns ...func(*ecr.Options)) (*ecr.PutLifecyclePolicyOutput, error)
+}
+
 type Handler struct {
 	webhookSecret string
 	cfg           Config
 	dstRepoName   string
-	ecrClient     *ecr.Client
+	ecrClient     ecrAPI
 	keychain      authn.Keychain
+	lockClient    *dynamolock.Client
+	nameOpts      []name.Option  // e.g. name.Insecure for tests
+	craneOpts     []crane.Option // applied to crane.Copy calls only; use nameOpts for remote.Get/WriteIndex transport
 }
 
 func NewHandler(ctx context.Context) (*Handler, error) {
@@ -94,12 +116,23 @@ func NewHandler(ctx context.Context) (*Handler, error) {
 		dstRepoName = cfg.DstRepoURL[i+1:]
 	}
 
+	lockClient, err := dynamolock.New(
+		dynamodb.NewFromConfig(awsCfg),
+		cfg.DynamoLockTable,
+		dynamolock.WithLeaseDuration(lockLeaseDuration),
+		dynamolock.WithHeartbeatPeriod(lockHeartbeat),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("creating lock client: %w", err)
+	}
+
 	return &Handler{
 		webhookSecret: webhookSecret,
 		cfg:           cfg,
 		dstRepoName:   dstRepoName,
 		ecrClient:     ecr.NewFromConfig(awsCfg),
 		keychain:      authn.NewMultiKeychain(rootKeychain, amazonKeychain),
+		lockClient:    lockClient,
 	}, nil
 }
 
@@ -158,21 +191,53 @@ func (h *Handler) Handle(ctx context.Context, req events.LambdaFunctionURLReques
 		canonicalRepo = normalizeRepo(canonicalRepo)
 	}
 
+	if !h.isRepoAllowed(data.ImageRepo) {
+		log.Info("repo not in allowlist, skipping", "repo", data.ImageRepo)
+		return respond(http.StatusOK, "repo not allowed")
+	}
+
 	ecrRepoName := fmt.Sprintf("%s/%s", h.dstRepoName, canonicalRepo)
 	if err := h.ensureECRRepo(ctx, ecrRepoName); err != nil {
 		log.Error("failed to ensure ECR repo", "error", err, "repo", ecrRepoName)
 		return respond(http.StatusInternalServerError, "internal error")
 	}
 
-	dst := fmt.Sprintf("%s/%s:%s", h.cfg.DstRepoURL, canonicalRepo, data.ImageTag)
+	if data.Arch == "" {
+		dst := fmt.Sprintf("%s/%s:%s", h.cfg.DstRepoURL, canonicalRepo, data.ImageTag)
+		log.Info("copying image (no arch)", "src", src, "dst", dst)
+		opts := slices.Concat(buildCopyOptions(ctx, h.keychain, ""), h.craneOpts)
+		if err := crane.Copy(src, dst, opts...); err != nil {
+			log.Error("failed to copy image", "error", err)
+			return respond(http.StatusInternalServerError, "image copy failed")
+		}
+		log.Info("image copied successfully", "dst", dst)
+		return respond(http.StatusOK, "ok")
+	}
 
-	log.Info("copying image", "src", src, "dst", dst)
-	if err := crane.Copy(src, dst, buildCopyOptions(h.keychain, ctx, data.Arch)...); err != nil {
-		log.Error("failed to copy image", "error", err, "src", src, "dst", dst)
+	archDst := fmt.Sprintf("%s/%s:%s-%s", h.cfg.DstRepoURL, canonicalRepo, data.ImageTag, data.Arch)
+	log.Info("copying arch image", "src", src, "dst", archDst, "arch", data.Arch)
+	opts := slices.Concat(buildCopyOptions(ctx, h.keychain, data.Arch), h.craneOpts)
+	if err := crane.Copy(src, archDst, opts...); err != nil {
+		log.Error("failed to copy arch image", "error", err)
 		return respond(http.StatusInternalServerError, "image copy failed")
 	}
 
-	log.Info("image copied successfully", "src", src, "dst", dst)
+	lockKey := fmt.Sprintf("%s:%s", data.ImageRepo, data.ImageTag)
+	unlock, err := h.lock(ctx, lockKey)
+	if err != nil {
+		log.Error("failed to acquire lock", "key", lockKey, "error", err)
+		return respond(http.StatusInternalServerError, "lock acquisition failed")
+	}
+	defer unlock()
+
+	indexDst := fmt.Sprintf("%s/%s:%s", h.cfg.DstRepoURL, canonicalRepo, data.ImageTag)
+	log.Info("updating image index", "index_dst", indexDst, "arch_src", archDst)
+	if err := updateImageIndex(ctx, h.keychain, archDst, indexDst, data.Arch, h.nameOpts...); err != nil {
+		log.Error("failed to update image index", "error", err)
+		return respond(http.StatusInternalServerError, "index update failed")
+	}
+
+	log.Info("image index updated successfully", "dst", indexDst, "arch", data.Arch)
 	return respond(http.StatusOK, "ok")
 }
 
@@ -183,7 +248,7 @@ func normalizeRepo(repo string) string {
 	return strings.TrimPrefix(repo, "library/")
 }
 
-func buildCopyOptions(keychain authn.Keychain, ctx context.Context, arch string) []crane.Option {
+func buildCopyOptions(ctx context.Context, keychain authn.Keychain, arch string) []crane.Option {
 	opts := []crane.Option{
 		crane.WithAuthFromKeychain(keychain),
 		crane.WithContext(ctx),
@@ -236,6 +301,10 @@ func (h *Handler) verifySignature(req events.LambdaFunctionURLRequest) error {
 // --- ECR helpers ---
 
 func (h *Handler) ensureECRRepo(ctx context.Context, repoName string) error {
+	if h.ecrClient == nil {
+		return nil
+	}
+	slog.Debug("creating repo...", "repo", repoName)
 	_, err := h.ecrClient.CreateRepository(ctx, &ecr.CreateRepositoryInput{
 		RepositoryName:     &repoName,
 		ImageTagMutability: ecrtypes.ImageTagMutabilityMutable,
@@ -243,12 +312,88 @@ func (h *Handler) ensureECRRepo(ctx context.Context, repoName string) error {
 	if err != nil {
 		var exists *ecrtypes.RepositoryAlreadyExistsException
 		if errors.As(err, &exists) {
+			slog.Debug("repo already exists, skipping creation", "repo", repoName)
 			return nil
 		}
 		return fmt.Errorf("creating ECR repo %s: %w", repoName, err)
 	}
 	slog.Info("created ECR repo", "repo", repoName)
+
+	slog.Debug("copying repo policy...", "baseRepo", h.dstRepoName, "repo", repoName)
+	if err := h.copyRepoPolicy(ctx, repoName); err != nil {
+		return err
+	}
+	slog.Debug("copied repo policy", "baseRepo", h.dstRepoName, "repo", repoName)
+
+	slog.Debug("copying lifecycle policy...", "baseRepo", h.dstRepoName, "repo", repoName)
+	if err := h.copyLifecyclePolicy(ctx, repoName); err != nil {
+		return err
+	}
+	slog.Debug("copied lifecycle policy", "baseRepo", h.dstRepoName, "repo", repoName)
+
 	return nil
+}
+
+func (h *Handler) copyRepoPolicy(ctx context.Context, newRepo string) error {
+	slog.Debug("getting repo policy...", "baseRepo", h.dstRepoName)
+	out, err := h.ecrClient.GetRepositoryPolicy(ctx, &ecr.GetRepositoryPolicyInput{
+		RepositoryName: &h.dstRepoName,
+	})
+	if err != nil {
+		var notFound *ecrtypes.RepositoryPolicyNotFoundException
+		if errors.As(err, &notFound) {
+			slog.Debug("no repo policy found in base repo, skipping", "baseRepo", h.dstRepoName)
+			return nil
+		}
+		return fmt.Errorf("getting repo policy from base repo: %w", err)
+	}
+
+	slog.Debug("setting repo policy...", "baseRepo", h.dstRepoName, "repo", newRepo)
+	_, err = h.ecrClient.SetRepositoryPolicy(ctx, &ecr.SetRepositoryPolicyInput{
+		RepositoryName: &newRepo,
+		PolicyText:     out.PolicyText,
+	})
+	return err
+}
+
+func (h *Handler) copyLifecyclePolicy(ctx context.Context, newRepo string) error {
+	slog.Debug("getting lifecycle policy...", "repo", h.dstRepoName)
+	out, err := h.ecrClient.GetLifecyclePolicy(ctx, &ecr.GetLifecyclePolicyInput{
+		RepositoryName: &h.dstRepoName,
+	})
+	if err != nil {
+		var notFound *ecrtypes.LifecyclePolicyNotFoundException
+		if errors.As(err, &notFound) {
+			slog.Debug("no lifecycle policy found in base repo, skipping", "repo", h.dstRepoName)
+			return nil
+		}
+		return fmt.Errorf("getting lifecycle policy from base repo: %w", err)
+	}
+
+	slog.Debug("setting lifecycle policy...", "baseRepo", h.dstRepoName, "repo", newRepo)
+	_, err = h.ecrClient.PutLifecyclePolicy(ctx, &ecr.PutLifecyclePolicyInput{
+		RepositoryName:      &newRepo,
+		LifecyclePolicyText: out.LifecyclePolicyText,
+	})
+	return err
+}
+
+func (h *Handler) isRepoAllowed(repo string) bool {
+	log := slog.With("repo", repo)
+	if len(h.cfg.AllowedRepos) == 0 {
+		log.Debug("no AllowedRepos configured, allowing all repos")
+		return true
+	}
+	for _, allowedRepo := range h.cfg.AllowedRepos {
+		log.Debug("checking AllowedRepos", "allowedRepo", allowedRepo)
+		if allowedRepo == repo {
+			log.Debug("repo allowed", "allowedRepo", allowedRepo)
+			return true
+		}
+	}
+	log.Debug("repo not allowed")
+
+	return false
 }
 
 // --- Auth ---
@@ -285,6 +430,26 @@ func getSecret(ctx context.Context, sm *secretsmanager.Client, arn string) (stri
 		return "", fmt.Errorf("getting secret %s: %w", arn, err)
 	}
 	return *out.SecretString, nil
+}
+
+func (h *Handler) lock(ctx context.Context, key string) (func(), error) {
+	if h.lockClient == nil {
+		return func() {}, nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, lockTimeout)
+	defer cancel()
+	lock, err := h.lockClient.AcquireLockWithContext(ctx, key,
+		dynamolock.WithRefreshPeriod(lockRetryDelay),
+		dynamolock.WithDeleteLockOnRelease(),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("acquiring lock %q: %w", key, err)
+	}
+	return func() {
+		if err := lock.Close(); err != nil {
+			slog.Error("failed to release lock", "key", key, "error", err)
+		}
+	}, nil
 }
 
 func respond(status int, body string) (events.LambdaFunctionURLResponse, error) {

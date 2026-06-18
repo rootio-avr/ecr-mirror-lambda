@@ -27,6 +27,20 @@ sequenceDiagram
 
 No long-lived credentials — the Lambda uses its IAM role for ECR and reads secrets from AWS Secrets Manager.
 
+## Multi-arch Images
+
+Root publishes multi-arch images by firing a separate webhook per architecture. The Lambda handles this safely:
+
+1. Each webhook copies its arch-specific image to ECR under a qualified tag: `{tag}-{arch}` (e.g. `3.13-amd64`, `3.13-arm64`)
+2. A distributed lock in DynamoDB (keyed on `{repo}:{tag}`) serialises concurrent arch events for the same tag
+3. The Lambda reads the existing OCI Image Index at `{tag}` from ECR (if any), adds or updates the entry for this arch, and pushes the updated index back under `{tag}`
+
+After all arch webhooks are processed, ECR contains:
+- `repo:{tag}` — an OCI Image Index referencing all mirrored arch variants
+- `repo:{tag}-{arch}` — an individual tagged image per arch (e.g. `3.13-amd64`, `3.13-arm64`)
+
+ECR lifecycle policies can target per-arch images using tag patterns like `*-amd64` or `*-arm64`.
+
 ## Prerequisites
 
 - **AWS CLI** — configured with an active profile ([install guide](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html))
@@ -180,7 +194,27 @@ This cleanly deletes the Lambda, IAM role, secrets, ECR repository, CloudWatch l
 | `root_registry_host` | No | `cr.root.io` | Root registry hostname |
 | `webhook_signing_secret` | No | `""` | HMAC signing secret from your Root webhook subscription. Empty on first apply; set after Step 4 |
 | `root_api_key` | **Yes** | — | Root API key for pulling images from the Root registry |
+| `allowed_repos` | No | `[]` | Allowlist of image repos to mirror (e.g. `["python", "golang"]`). When empty, all repos are mirrored |
 | `log_retention_days` | No | `14` | CloudWatch log retention in days |
+
+### Repo Allowlist
+
+By default, the Lambda mirrors every image repo that Root notifies it about. To restrict mirroring to a specific set of repos, set `allowed_repos` in `terraform.tfvars`:
+
+```hcl
+allowed_repos = ["python", "golang", "node"]
+```
+
+Events for repos not in the list are acknowledged with a 200 and silently ignored.
+
+### Sub-repo Creation
+
+When a new image arrives for a repo that doesn't yet exist in ECR (e.g. `root-mirror/python`), the Lambda creates it automatically and copies the following settings from the base repo (`root-mirror`):
+
+- **Repository policy** (pull/push permissions)
+- **Lifecycle policy** (image expiry rules)
+
+If the base repo has no policy or lifecycle rule set, the new sub-repo is created without one. Repos that already exist are left untouched.
 
 ### Outputs
 
@@ -221,6 +255,7 @@ graph TD
 | **Minimal IAM** | Lambda can only push to its target ECR repo and read its two secrets |
 | **Timing-safe comparison** | HMAC verified with `hmac.Equal` to prevent timing attacks |
 | **Event filtering** | Only `io.root.cr.image.created.v1` events are processed |
+| **Repo allowlist** | Optional `allowed_repos` list restricts which image repos are mirrored |
 
 ## Troubleshooting
 
