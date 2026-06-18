@@ -56,6 +56,10 @@ type Config struct {
 	RegistryHost     string   `env:"ROOT_REGISTRY_HOST" envDefault:"cr.root.io"`
 	AllowedRepos     []string `env:"ALLOWED_REPOS" envSeparator:","`
 	DynamoLockTable  string   `env:"DYNAMO_LOCK_TABLE,required"`
+	// NormalizeRepo strips the "library/" prefix from Docker Hub official image repos
+	// (e.g. "library/python" → "python") to match CCR naming conventions.
+	// Disabled by default to avoid breaking existing deployments.
+	NormalizeRepo bool `env:"NORMALIZE_REPO" envDefault:"false"`
 }
 
 type ecrAPI interface {
@@ -182,20 +186,24 @@ func (h *Handler) Handle(ctx context.Context, req events.LambdaFunctionURLReques
 	}
 
 	src := ce.Subject()
+	canonicalRepo := data.ImageRepo
+	if h.cfg.NormalizeRepo {
+		canonicalRepo = normalizeRepo(canonicalRepo)
+	}
 
 	if !h.isRepoAllowed(data.ImageRepo) {
 		log.Info("repo not in allowlist, skipping", "repo", data.ImageRepo)
 		return respond(http.StatusOK, "repo not allowed")
 	}
 
-	ecrRepoName := fmt.Sprintf("%s/%s", h.dstRepoName, data.ImageRepo)
+	ecrRepoName := fmt.Sprintf("%s/%s", h.dstRepoName, canonicalRepo)
 	if err := h.ensureECRRepo(ctx, ecrRepoName); err != nil {
 		log.Error("failed to ensure ECR repo", "error", err, "repo", ecrRepoName)
 		return respond(http.StatusInternalServerError, "internal error")
 	}
 
 	if data.Arch == "" {
-		dst := fmt.Sprintf("%s/%s:%s", h.cfg.DstRepoURL, data.ImageRepo, data.ImageTag)
+		dst := fmt.Sprintf("%s/%s:%s", h.cfg.DstRepoURL, canonicalRepo, data.ImageTag)
 		log.Info("copying image (no arch)", "src", src, "dst", dst)
 		opts := slices.Concat(buildCopyOptions(ctx, h.keychain, ""), h.craneOpts)
 		if err := crane.Copy(src, dst, opts...); err != nil {
@@ -206,7 +214,7 @@ func (h *Handler) Handle(ctx context.Context, req events.LambdaFunctionURLReques
 		return respond(http.StatusOK, "ok")
 	}
 
-	archDst := fmt.Sprintf("%s/%s:%s-%s", h.cfg.DstRepoURL, data.ImageRepo, data.ImageTag, data.Arch)
+	archDst := fmt.Sprintf("%s/%s:%s-%s", h.cfg.DstRepoURL, canonicalRepo, data.ImageTag, data.Arch)
 	log.Info("copying arch image", "src", src, "dst", archDst, "arch", data.Arch)
 	opts := slices.Concat(buildCopyOptions(ctx, h.keychain, data.Arch), h.craneOpts)
 	if err := crane.Copy(src, archDst, opts...); err != nil {
@@ -222,7 +230,7 @@ func (h *Handler) Handle(ctx context.Context, req events.LambdaFunctionURLReques
 	}
 	defer unlock()
 
-	indexDst := fmt.Sprintf("%s/%s:%s", h.cfg.DstRepoURL, data.ImageRepo, data.ImageTag)
+	indexDst := fmt.Sprintf("%s/%s:%s", h.cfg.DstRepoURL, canonicalRepo, data.ImageTag)
 	log.Info("updating image index", "index_dst", indexDst, "arch_src", archDst)
 	if err := updateImageIndex(ctx, h.keychain, archDst, indexDst, data.Arch, h.nameOpts...); err != nil {
 		log.Error("failed to update image index", "error", err)
@@ -231,6 +239,13 @@ func (h *Handler) Handle(ctx context.Context, req events.LambdaFunctionURLReques
 
 	log.Info("image index updated successfully", "dst", indexDst, "arch", data.Arch)
 	return respond(http.StatusOK, "ok")
+}
+
+// normalizeRepo maps Root's registry-style repo name to the CCR canonical form.
+// Docker Hub official images are prefixed "library/" in Root (e.g. "library/python")
+// but stored as bare names in CCR (e.g. "python"), matching rootio-config.json keys.
+func normalizeRepo(repo string) string {
+	return strings.TrimPrefix(repo, "library/")
 }
 
 func buildCopyOptions(ctx context.Context, keychain authn.Keychain, arch string) []crane.Option {
