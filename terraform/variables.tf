@@ -45,3 +45,9 @@ variable "log_retention_days" {
   description = "CloudWatch log group retention in days."
   default     = 14
 }
+
+variable "name_suffix" {
+  type        = string
+  description = "Optional suffix appended to all resource names (e.g. a CI run ID) to avoid collisions between concurrent deployments."
+  default     = ""
+}
